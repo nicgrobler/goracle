@@ -306,8 +306,10 @@ var Log func(...interface{}) error
 func init() {
 	d, err := newDrv()
 	if err != nil {
-		panic(err)
-	}
+                //push this through to caller - but for the love of God don't panic. it is rude as ****
+		sql.Register("goracle", &drv{})
+		return
+        }
 	sql.Register("goracle", d)
 }
 
