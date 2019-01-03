@@ -308,7 +308,8 @@ func init() {
 	d, err := newDrv()
 	if err != nil {
 		//push this through to caller - but for the love of God don't panic. it is rude as ****
-		d = &invalid_drv{}
+		sql.Register("goracle", &invalid_drv{})
+		return
 	}
 	sql.Register("goracle", d)
 }
