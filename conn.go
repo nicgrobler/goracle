@@ -26,7 +26,6 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"strings"
-	//"fmt"
 	"sync"
 	"time"
 	"unsafe"
@@ -35,6 +34,13 @@ import (
 )
 
 const getConnection = "--GET_CONNECTION--"
+const wrapResultset = "--WRAP_RESULTSET--"
+
+// The maximum capacity is limited to (2^32 / sizeof(dpiData))-1 to remain compatible
+// with 32-bit platforms. The size of a `C.dpiData` is 32 Byte on a 64-bit system, `C.dpiSubscrMessageTable` is 40 bytes.
+// So this is 2^25.
+// See https://github.com/go-goracle/goracle/issues/73#issuecomment-401281714
+const maxArraySize = (1<<30)/C.sizeof_dpiSubscrMessageTable - 1
 
 var _ = driver.Conn((*conn)(nil))
 var _ = driver.ConnBeginTx((*conn)(nil))
@@ -43,10 +49,12 @@ var _ = driver.Pinger((*conn)(nil))
 
 type conn struct {
 	sync.RWMutex
-	dpiConn       *C.dpiConn
-	connParams    ConnectionParams
-	inTransaction bool
-	serverVersion VersionInfo
+	dpiConn        *C.dpiConn
+	connParams     ConnectionParams
+	inTransaction  bool
+	Client, Server VersionInfo
+	setTT          TraceTag
+	currentUser    string
 	*drv
 }
 
@@ -69,8 +77,17 @@ func (c *conn) Break() error {
 	return nil
 }
 
+// Ping checks the connection's state.
+//
+// WARNING: as database/sql calls database/sql/driver.Open when it needs
+// a new connection, but does not provide this Context,
+// if the Open stalls (unreachable / firewalled host), the
+// database/sql.Ping may return way after the Context.Deadline!
 func (c *conn) Ping(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := c.ensureContextUser(ctx); err != nil {
 		return err
 	}
 	c.RLock()
@@ -167,13 +184,34 @@ func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, e
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+
+	var todo []string
 	if opts.ReadOnly {
-		return nil, errors.New("read-only transaction property is not supported")
+		todo = append(todo, "READ ONLY")
+	} else {
+		todo = append(todo, "READ WRITE")
 	}
 	switch level := sql.IsolationLevel(opts.Isolation); level {
-	case sql.LevelDefault, sql.LevelReadCommitted:
+	case sql.LevelDefault:
+	case sql.LevelReadCommitted:
+		todo = append(todo, "ISOLATION LEVEL READ COMMITTED")
+	case sql.LevelSerializable:
+		todo = append(todo, "ISOLATION LEVEL SERIALIZABLE")
 	default:
 		return nil, errors.Errorf("%v isolation level is not supported", sql.IsolationLevel(opts.Isolation))
+	}
+
+	for _, qry := range todo {
+		qry = "SET TRANSACTION " + qry
+		stmt, err := c.PrepareContext(ctx, qry)
+		if err == nil {
+			//fmt.Println(qry)
+			_, err = stmt.Exec(nil) //nolint:typecheck,megacheck
+			stmt.Close()
+		}
+		if err != nil {
+			return nil, maybeBadConn(errors.Wrap(err, qry))
+		}
 	}
 
 	c.RLock()
@@ -198,6 +236,9 @@ func (c *conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, e
 // it must not store the context within the statement itself.
 func (c *conn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := c.ensureContextUser(ctx); err != nil {
 		return nil, err
 	}
 	if tt, ok := ctx.Value(traceTagCtxKey).(TraceTag); ok {
@@ -289,33 +330,47 @@ func (c *conn) newVar(vi varInfo) (*C.dpiVar, []C.dpiData, error) {
 	/*
 		var theCArray *C.YourType = C.getTheArray()
 		length := C.getTheArrayLength()
-		slice := (*[1 << 30]C.YourType)(unsafe.Pointer(theCArray))[:length:length]
+		slice := (*[maxArraySize]C.YourType)(unsafe.Pointer(theCArray))[:length:length]
 	*/
-	data := ((*[1 << 30]C.dpiData)(unsafe.Pointer(dataArr)))[:vi.SliceLen:vi.SliceLen]
+	data := ((*[maxArraySize]C.dpiData)(unsafe.Pointer(dataArr)))[:vi.SliceLen:vi.SliceLen]
 	return v, data, nil
 }
 
 var _ = driver.Tx((*conn)(nil))
 
 func (c *conn) ServerVersion() (VersionInfo, error) {
-	c.RLock()
-	sv := c.serverVersion
-	c.RUnlock()
-	if sv.Version != 0 {
-		return sv, nil
+	return c.Server, nil
+}
+
+func (c *conn) init() error {
+	if c.Server.Version != 0 {
+		return nil
+	}
+	var err error
+	if c.Client, err = c.drv.ClientVersion(); err != nil {
+		return err
 	}
 	var v C.dpiVersionInfo
 	var release *C.char
 	var releaseLen C.uint32_t
 	if C.dpiConn_getServerVersion(c.dpiConn, &release, &releaseLen, &v) == C.DPI_FAILURE {
-		return sv, errors.Wrap(c.getError(), "getServerVersion")
+		return errors.Wrap(c.getError(), "getServerVersion")
 	}
-	c.Lock()
-	c.serverVersion.set(&v)
-	c.serverVersion.ServerRelease = C.GoStringN(release, C.int(releaseLen))
-	sv = c.serverVersion
-	c.Unlock()
-	return sv, nil
+	c.Server.set(&v)
+	c.Server.ServerRelease = C.GoStringN(release, C.int(releaseLen))
+	return nil
+}
+
+func (c *conn) setCallTimeout(ctx context.Context) {
+	if c.Client.Version < 18 {
+		return
+	}
+	var ms C.uint32_t
+	if dl, ok := ctx.Deadline(); ok {
+		ms = C.uint32_t(time.Until(dl) / time.Millisecond)
+	}
+	// force it to be 0 (disabled)
+	C.dpiConn_setCallTimeout(c.dpiConn, ms)
 }
 
 func maybeBadConn(err error) error {
@@ -340,57 +395,33 @@ func maybeBadConn(err error) error {
 		case 12170, 12528, 12545, 24315, 28547:
 
 			//cases from https://github.com/oracle/odpi/blob/master/src/dpiError.c#L61-L94
-		case 22: // invalid session ID; access denied
-			fallthrough
-		case 28: // your session has been killed
-			fallthrough
-		case 31: // your session has been marked for kill
-			fallthrough
-		case 45: // your session has been terminated with no replay
-			fallthrough
-		case 378: // buffer pools cannot be created as specified
-			fallthrough
-		case 602: // internal programming exception
-			fallthrough
-		case 603: // ORACLE server session terminated by fatal error
-			fallthrough
-		case 609: // could not attach to incoming connection
-			fallthrough
-		case 1012: // not logged on
-			fallthrough
-		case 1041: // internal error. hostdef extension doesn't exist
-			fallthrough
-		case 1043: // user side memory corruption
-			fallthrough
-		case 1089: // immediate shutdown or close in progress
-			fallthrough
-		case 1092: // ORACLE instance terminated. Disconnection forced
-			fallthrough
-		case 2396: // exceeded maximum idle time, please connect again
-			fallthrough
-		case 3113: // end-of-file on communication channel
-			fallthrough
-		case 3114: // not connected to ORACLE
-			fallthrough
-		case 3122: // attempt to close ORACLE-side window on user side
-			fallthrough
-		case 3135: // connection lost contact
-			fallthrough
-		case 12153: // TNS:not connected
-			fallthrough
-		case 12537: // TNS:connection closed
-			fallthrough
-		case 12547: // TNS:lost contact
-			fallthrough
-		case 12570: // TNS:packet reader failure
-			fallthrough
-		case 12583: // TNS:no reader
-			fallthrough
-		case 27146: // post/wait initialization failed
-			fallthrough
-		case 28511: // lost RPC connection
-			fallthrough
-		case 56600: // an illegal OCI function call was issued
+		case 22, // invalid session ID; access denied
+			28,    // your session has been killed
+			31,    // your session has been marked for kill
+			45,    // your session has been terminated with no replay
+			378,   // buffer pools cannot be created as specified
+			602,   // internal programming exception
+			603,   // ORACLE server session terminated by fatal error
+			609,   // could not attach to incoming connection
+			1012,  // not logged on
+			1041,  // internal error. hostdef extension doesn't exist
+			1043,  // user side memory corruption
+			1089,  // immediate shutdown or close in progress
+			1092,  // ORACLE instance terminated. Disconnection forced
+			2396,  // exceeded maximum idle time, please connect again
+			3113,  // end-of-file on communication channel
+			3114,  // not connected to ORACLE
+			3122,  // attempt to close ORACLE-side window on user side
+			3135,  // connection lost contact
+			3136,  // inbound connection timed out
+			12153, // TNS:not connected
+			12537, // TNS:connection closed
+			12547, // TNS:lost contact
+			12570, // TNS:packet reader failure
+			12583, // TNS:no reader
+			27146, // post/wait initialization failed
+			28511, // lost RPC connection
+			56600: // an illegal OCI function call was issued
 			return driver.ErrBadConn
 		}
 	}
@@ -403,29 +434,33 @@ func (c *conn) setTraceTag(tt TraceTag) error {
 	}
 	//fmt.Fprintf(os.Stderr, "setTraceTag %s\n", tt)
 	var err error
-	for nm, v := range map[string]*string{
-		"action":     &tt.Action,
-		"module":     &tt.Module,
-		"info":       &tt.ClientInfo,
-		"identifier": &tt.ClientIdentifier,
-		"op":         &tt.DbOp,
+	for nm, vv := range map[string][2]string{
+		"action":     {c.setTT.Action, tt.Action},
+		"module":     {c.setTT.Module, tt.Module},
+		"info":       {c.setTT.ClientInfo, tt.ClientInfo},
+		"identifier": {c.setTT.ClientIdentifier, tt.ClientIdentifier},
+		"op":         {c.setTT.DbOp, tt.DbOp},
 	} {
+		if vv[0] == vv[1] {
+			continue
+		}
+		v := vv[1]
 		var s *C.char
-		if *v != "" {
-			s = C.CString(*v)
+		if v != "" {
+			s = C.CString(v)
 		}
 		var rc C.int
 		switch nm {
 		case "action":
-			rc = C.dpiConn_setAction(c.dpiConn, s, C.uint32_t(len(*v)))
+			rc = C.dpiConn_setAction(c.dpiConn, s, C.uint32_t(len(v)))
 		case "module":
-			rc = C.dpiConn_setModule(c.dpiConn, s, C.uint32_t(len(*v)))
+			rc = C.dpiConn_setModule(c.dpiConn, s, C.uint32_t(len(v)))
 		case "info":
-			rc = C.dpiConn_setClientInfo(c.dpiConn, s, C.uint32_t(len(*v)))
+			rc = C.dpiConn_setClientInfo(c.dpiConn, s, C.uint32_t(len(v)))
 		case "identifier":
-			rc = C.dpiConn_setClientIdentifier(c.dpiConn, s, C.uint32_t(len(*v)))
+			rc = C.dpiConn_setClientIdentifier(c.dpiConn, s, C.uint32_t(len(v)))
 		case "op":
-			rc = C.dpiConn_setDbOp(c.dpiConn, s, C.uint32_t(len(*v)))
+			rc = C.dpiConn_setDbOp(c.dpiConn, s, C.uint32_t(len(v)))
 		}
 		if rc == C.DPI_FAILURE && err == nil {
 			err = errors.Wrap(c.getError(), nm)
@@ -434,6 +469,7 @@ func (c *conn) setTraceTag(tt TraceTag) error {
 			C.free(unsafe.Pointer(s))
 		}
 	}
+	c.setTT = tt
 	return err
 }
 
@@ -458,4 +494,39 @@ type TraceTag struct {
 	Module string
 	// Action - specifies an action, such as an INSERT or UPDATE operation, in a module
 	Action string
+}
+
+const userpwCtxKey = ctxKey("userPw")
+
+// ContextWithUserPassw returns a context with the specified user and password,
+// to be used with heterogeneous pools.
+func ContextWithUserPassw(ctx context.Context, user, password string) context.Context {
+	return context.WithValue(ctx, userpwCtxKey, [2]string{user, password})
+}
+
+func (c *conn) ensureContextUser(ctx context.Context) error {
+	if !c.connParams.HeterogeneousPool {
+		return nil
+	}
+
+	var up [2]string
+	var ok bool
+	if up, ok = ctx.Value(userpwCtxKey).([2]string); !ok || up[0] == c.currentUser {
+		return nil
+	}
+
+	if c.dpiConn != nil {
+		if err := c.Close(); err != nil {
+			return driver.ErrBadConn
+		}
+	}
+
+	c.Lock()
+	defer c.Unlock()
+
+	if err := c.acquireConn(up[0], up[1]); err != nil {
+		return err
+	}
+
+	return c.init()
 }

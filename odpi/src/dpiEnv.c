@@ -1,5 +1,5 @@
 //-----------------------------------------------------------------------------
-// Copyright (c) 2016, 2017 Oracle and/or its affiliates.  All rights reserved.
+// Copyright (c) 2016, 2018, Oracle and/or its affiliates. All rights reserved.
 // This program is free software: you can modify it and/or redistribute it
 // under the terms of:
 //
@@ -153,8 +153,12 @@ int dpiEnv__init(dpiEnv *env, const dpiContext *context,
         return DPI_FAILURE;
 
     // set whether or not we are threaded
-    if (params->createMode & DPI_OCI_THREADED)
+    if (params->createMode & DPI_MODE_CREATE_THREADED)
         env->threaded = 1;
+
+    // set whether or not events mode has been set
+    if (params->createMode & DPI_MODE_CREATE_EVENTS)
+        env->events = 1;
 
     return DPI_SUCCESS;
 }

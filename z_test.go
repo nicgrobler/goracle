@@ -51,9 +51,9 @@ var (
 	testConStr                   string
 )
 
-const maxSessions = 64
-
 var tblSuffix = "_" + strings.Replace(runtime.Version(), ".", "#", -1)
+
+const maxSessions = 64
 
 func init() {
 	logger := &log.SwapLogger{}
@@ -62,7 +62,7 @@ func init() {
 		logger.Swap(tl)
 	}
 
-	testConStr = fmt.Sprintf("oracle://%s:%s@%s/?poolMinSessions=1&poolMaxSessions=%d&poolIncrement=1&connectionClass=POOLED",
+	testConStr = fmt.Sprintf("oracle://%s:%s@%s/?poolMinSessions=1&poolMaxSessions=%d&poolIncrement=1&connectionClass=POOLED&noConnectionPooling=0&enableEvents=1&heterogeneousPool=0",
 		os.Getenv("GORACLE_DRV_TEST_USERNAME"),
 		os.Getenv("GORACLE_DRV_TEST_PASSWORD"),
 		os.Getenv("GORACLE_DRV_TEST_DB"),
@@ -98,7 +98,7 @@ type testLogger struct {
 }
 
 func (tl *testLogger) Log(args ...interface{}) error {
-	fmt.Println(args)
+	fmt.Println(args...)
 	return tl.GetLog()(args)
 }
 func (tl *testLogger) GetLog() func(keyvals ...interface{}) error {
@@ -177,7 +177,9 @@ func TestParseOnly(t *testing.T) {
 	tbl := "test_not_exist" + tblSuffix
 	cnt := func() int {
 		var cnt int64
-		if err := testDb.QueryRowContext(ctx, "SELECT COUNT(0) FROM user_tables WHERE table_name = UPPER('"+tbl+"')").Scan(&cnt); err != nil {
+		if err := testDb.QueryRowContext(ctx,
+			"SELECT COUNT(0) FROM user_tables WHERE table_name = UPPER('"+tbl+"')").Scan(&cnt); //nolint:gas
+		err != nil {
 			t.Fatal(err)
 		}
 		return int(cnt)
@@ -631,7 +633,7 @@ func TestSelectRefCursor(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	rows, err := testDb.QueryContext(ctx, "SELECT CURSOR(SELECT object_name, object_type, object_id, created FROM all_objects WHERE ROWNUM < 1000) FROM DUAL")
+	rows, err := testDb.QueryContext(ctx, "SELECT CURSOR(SELECT object_name, object_type, object_id, created FROM all_objects WHERE ROWNUM <= 10) FROM DUAL")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -662,41 +664,37 @@ func TestSelectRefCursor(t *testing.T) {
 	}
 }
 
-func TestSelect(t *testing.T) {
+func TestSelectRefCursorWrap(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	conn, err := testDb.Conn(ctx)
+	rows, err := testDb.QueryContext(ctx, "SELECT CURSOR(SELECT object_name, object_type, object_id, created FROM all_objects WHERE ROWNUM <= 10) FROM DUAL")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
-	const num = 1000
-	rows, err := testDb.QueryContext(ctx, "SELECT object_name, object_type, object_id, created FROM all_objects WHERE ROWNUM < NVL(:alpha, 2) ORDER BY object_id", sql.Named("alpha", num))
-	//rows, err := testDb.QueryContext(ctx, "SELECT object_name, object_type, object_id, created FROM all_objects WHERE ROWNUM < 1000 ORDER BY object_id")
-	if err != nil {
-		t.Fatalf("%+v", err)
-	}
-	n, oldOid := 0, int64(0)
+	defer rows.Close()
 	for rows.Next() {
-		var tbl, typ string
-		var oid int64
-		var created time.Time
-		if err := rows.Scan(&tbl, &typ, &oid, &created); err != nil {
+		var intf interface{}
+		if err := rows.Scan(&intf); err != nil {
+			t.Error(err)
+			continue
+		}
+		t.Logf("%T", intf)
+		sub, err := goracle.WrapRows(ctx, testDb, intf.(driver.Rows))
+		if err != nil {
 			t.Fatal(err)
 		}
-		t.Log(tbl, typ, oid, created)
-		if tbl == "" {
-			t.Fatal("empty tbl")
+		t.Log("Sub", sub)
+		for sub.Next() {
+			var oName, oType, oID string
+			var created time.Time
+			if err := sub.Scan(&oName, &oType, &oID, &created); err != nil {
+				t.Error(err)
+				break
+			}
+			t.Log(oName, oType, oID, created)
 		}
-		n++
-		if oldOid > oid {
-			t.Errorf("got oid=%d, wanted sth < %d.", oid, oldOid)
-		}
-		oldOid = oid
-	}
-	if n != num-1 {
-		t.Errorf("got %d rows, wanted %d", n, num-1)
+		sub.Close()
 	}
 }
 
@@ -747,10 +745,11 @@ func TestExecuteMany(t *testing.T) {
 		{"f_dt", dates},
 	} {
 		res, execErr := conn.ExecContext(ctx,
-			"INSERT INTO "+tbl+" ("+tc.Name+") VALUES (:1)",
+			"INSERT INTO "+tbl+" ("+tc.Name+") VALUES (:1)", //nolint:gas
 			tc.Value)
 		if execErr != nil {
-			t.Fatalf("%d. INSERT INTO "+tbl+" (%q) VALUES (%+v): %#v", i, tc.Name, tc.Value, execErr)
+			t.Fatalf("%d. INSERT INTO "+tbl+" (%q) VALUES (%+v): %#v", //nolint:gas
+				i, tc.Name, tc.Value, execErr)
 		}
 		ra, raErr := res.RowsAffected()
 		if raErr != nil {
@@ -763,10 +762,10 @@ func TestExecuteMany(t *testing.T) {
 	conn.ExecContext(ctx, "TRUNCATE TABLE "+tbl+"")
 
 	res, err := conn.ExecContext(ctx,
-		`INSERT INTO `+tbl+`
-		  (f_id, f_int, f_num, f_num_6, F_num_5_2, F_vc, F_dt)
-		  VALUES
-		  (:1, :2, :3, :4, :5, :6, :7)`,
+		`INSERT INTO `+tbl+ //nolint:gas
+			` (f_id, f_int, f_num, f_num_6, F_num_5_2, F_vc, F_dt)
+			VALUES
+			(:1, :2, :3, :4, :5, :6, :7)`,
 		ids, ints, nums, int32s, floats, strs, dates)
 	if err != nil {
 		t.Fatalf("%#v", err)
@@ -778,7 +777,9 @@ func TestExecuteMany(t *testing.T) {
 		t.Errorf("wanted %d rows, got %d", num, ra)
 	}
 
-	rows, err := conn.QueryContext(ctx, "SELECT * FROM "+tbl+" ORDER BY F_id")
+	rows, err := conn.QueryContext(ctx,
+		"SELECT * FROM "+tbl+" ORDER BY F_id", //nolint:gas
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -831,10 +832,16 @@ func TestReadWriteLob(t *testing.T) {
 	defer conn.Close()
 	tbl := "test_lob" + tblSuffix
 	conn.ExecContext(ctx, "DROP TABLE "+tbl)
-	conn.ExecContext(ctx, "CREATE TABLE "+tbl+" (f_id NUMBER(6), f_blob BLOB, f_clob CLOB)")
-	defer testDb.Exec("DROP TABLE " + tbl)
+	conn.ExecContext(ctx,
+		"CREATE TABLE "+tbl+" (f_id NUMBER(6), f_blob BLOB, f_clob CLOB)", //nolint:gas
+	)
+	defer testDb.Exec(
+		"DROP TABLE " + tbl, //nolint:gas
+	)
 
-	stmt, err := conn.PrepareContext(ctx, "INSERT INTO "+tbl+" (F_id, f_blob, F_clob) VALUES (:1, :2, :3)")
+	stmt, err := conn.PrepareContext(ctx,
+		"INSERT INTO "+tbl+" (F_id, f_blob, F_clob) VALUES (:1, :2, :3)", //nolint:gas
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -859,7 +866,10 @@ func TestReadWriteLob(t *testing.T) {
 		}
 
 		var rows *sql.Rows
-		rows, err = conn.QueryContext(ctx, "SELECT F_id, F_blob, F_clob FROM "+tbl+" WHERE F_id IN (:1, :2)", 2*tN, 2*tN+1)
+		rows, err = conn.QueryContext(ctx,
+			"SELECT F_id, F_blob, F_clob FROM "+tbl+" WHERE F_id IN (:1, :2)", //nolint:gas
+			goracle.LobAsReader(),
+			2*tN, 2*tN+1)
 		if err != nil {
 			t.Errorf("%d/3. %v", tN, err)
 			continue
@@ -898,7 +908,9 @@ func TestReadWriteLob(t *testing.T) {
 		rows.Close()
 	}
 
-	rows, err := conn.QueryContext(ctx, "SELECT F_clob FROM "+tbl+"", goracle.ClobAsString())
+	rows, err := conn.QueryContext(ctx,
+		"SELECT F_clob FROM "+tbl+"", //nolint:gas
+		goracle.ClobAsString())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -910,6 +922,38 @@ func TestReadWriteLob(t *testing.T) {
 		}
 		t.Logf("clobAsString: %q", s)
 	}
+
+	qry := "SELECT CURSOR(SELECT f_id, f_clob FROM " + tbl + " WHERE ROWNUM <= 10) FROM DUAL"
+	rows, err = testDb.QueryContext(ctx, qry, goracle.ClobAsString())
+	if err != nil {
+		t.Fatal(errors.Wrap(err, qry))
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var intf interface{}
+		if err := rows.Scan(&intf); err != nil {
+			t.Error(err)
+			continue
+		}
+		t.Logf("%T", intf)
+		sub := intf.(driver.RowsColumnTypeScanType)
+		cols := sub.Columns()
+		t.Log("Columns", cols)
+		dests := make([]driver.Value, len(cols))
+		for {
+			if err := sub.Next(dests); err != nil {
+				if err == io.EOF {
+					break
+				}
+				t.Error(err)
+				break
+			}
+			//fmt.Println(dests)
+			t.Log(dests)
+		}
+		sub.Close()
+	}
+
 }
 
 func copySlice(orig interface{}) interface{} {
@@ -923,6 +967,7 @@ func copySlice(orig interface{}) interface{} {
 }
 
 func TestObject(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	conn, err := testDb.Conn(ctx)
@@ -967,7 +1012,7 @@ func TestOpenClose(t *testing.T) {
 	}
 	cs.MinSessions, cs.MaxSessions = 1, 5
 	t.Log(cs.String())
-	db, err := sql.Open("goracle", cs.String())
+	db, err := sql.Open("goracle", cs.StringWithPassword())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -979,6 +1024,9 @@ func TestOpenClose(t *testing.T) {
 	const module = "goracle.v2.test-OpenClose "
 	stmt, err := db.PrepareContext(ctx, "SELECT COUNT(0) FROM v$session WHERE module LIKE '"+module+"%'")
 	if err != nil {
+		if strings.Contains(err.Error(), "ORA-12516:") {
+			t.Skip(err)
+		}
 		t.Fatal(err)
 	}
 	defer stmt.Close()
@@ -1006,6 +1054,10 @@ func TestOpenClose(t *testing.T) {
 		ctx = goracle.ContextWithTraceTag(ctx, tt)
 		tx2, err2 := db.BeginTx(ctx, nil)
 		if err2 != nil {
+			if strings.Contains(err2.Error(), "ORA-12516:") {
+				tx1.Rollback()
+				break
+			}
 			t.Fatal(err2)
 		}
 		if n, err = sessCount(); err != nil {
@@ -1050,6 +1102,7 @@ func TestOpenBadMemory(t *testing.T) {
 }
 
 func TestSelectFloat(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	tbl := "test_numbers" + tblSuffix
@@ -1065,14 +1118,14 @@ func TestSelectFloat(t *testing.T) {
 	defer testDb.Exec("DROP TABLE " + tbl)
 
 	const INT, FLOAT = 1234567, 4.5
-	qry = `INSERT INTO ` + tbl + `
-	(INT_COL, FLOAT_COL, EMPTY_INT_COL)
+	qry = `INSERT INTO ` + tbl + //nolint:gas
+		` (INT_COL, FLOAT_COL, EMPTY_INT_COL)
      VALUES (1234567, 45/10, NULL)`
 	if _, err := testDb.ExecContext(ctx, qry); err != nil {
 		t.Fatal(errors.Wrap(err, qry))
 	}
 
-	qry = "SELECT int_col, float_col, empty_int_col FROM " + tbl
+	qry = "SELECT int_col, float_col, empty_int_col FROM " + tbl //nolint:gas
 	type numbers struct {
 		Int     int
 		Int64   int64
@@ -1139,6 +1192,7 @@ func TestSelectFloat(t *testing.T) {
 }
 
 func TestNumInputs(t *testing.T) {
+	t.Parallel()
 	var a, b string
 	if err := testDb.QueryRow("SELECT :1, :2 FROM DUAL", 'a', 'b').Scan(&a, &b); err != nil {
 		t.Errorf("two inputs: %+v", err)
@@ -1152,6 +1206,7 @@ func TestNumInputs(t *testing.T) {
 }
 
 func TestPtrArg(t *testing.T) {
+	t.Parallel()
 	s := "dog"
 	rows, err := testDb.Query("SELECT * FROM user_objects WHERE object_name=:1", &s)
 	if err != nil {
@@ -1160,6 +1215,7 @@ func TestPtrArg(t *testing.T) {
 	rows.Close()
 }
 func TestORA1000(t *testing.T) {
+	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	rows, err := testDb.QueryContext(ctx, "SELECT * FROM user_objects")
@@ -1169,7 +1225,9 @@ func TestORA1000(t *testing.T) {
 	defer rows.Close()
 	for i := 0; i < 1000; i++ {
 		var n int64
-		if err := testDb.QueryRowContext(ctx, "SELECT /*"+strconv.Itoa(i)+"*/ 1 FROM DUAL").Scan(&n); err != nil {
+		if err := testDb.QueryRowContext(ctx,
+			"SELECT /*"+strconv.Itoa(i)+"*/ 1 FROM DUAL", //nolint:gas
+		).Scan(&n); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1182,10 +1240,27 @@ func TestRanaOraIssue244(t *testing.T) {
 	if _, err := testDb.Exec(qry); err != nil {
 		t.Fatal(errors.Wrap(err, qry))
 	}
+	var max int
+	ctx, cancel := context.WithCancel(context.Background())
+	txs := make([]*sql.Tx, 0, maxSessions)
+	for max = 0; max < maxSessions; max++ {
+		tx, err := testDb.BeginTx(ctx, nil)
+		if err != nil {
+			max--
+			break
+		}
+		txs = append(txs, tx)
+	}
+	cancel()
+	for _, tx := range txs {
+		tx.Rollback()
+	}
+	t.Logf("maxSessions=%d max=%d", maxSessions, max)
+
 	defer testDb.Exec("DROP TABLE " + tableName)
 	const bf = "143"
 	const sc = "270004"
-	qry = "INSERT INTO " + tableName + " (fund_account, fund_code, business_flag, money_type) VALUES (:1, :2, :3, :4)"
+	qry = "INSERT INTO " + tableName + " (fund_account, fund_code, business_flag, money_type) VALUES (:1, :2, :3, :4)" //nolint:gas
 	stmt, err := testDb.Prepare(qry)
 	if err != nil {
 		t.Fatal(errors.Wrap(err, qry))
@@ -1199,25 +1274,25 @@ func TestRanaOraIssue244(t *testing.T) {
 	}
 	stmt.Close()
 
-	dur := time.Minute
+	dur := time.Minute / 2
 	if testing.Short() {
 		dur = 10 * time.Second
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), dur)
+	ctx, cancel = context.WithTimeout(context.Background(), dur)
 	defer cancel()
 
+	qry = `SELECT fund_account, money_type FROM ` + tableName + ` WHERE business_flag = :1 AND fund_code = :2 AND fund_account = :3` //nolint:gas
 	grp, ctx := errgroup.WithContext(ctx)
-	for i := 0; i < maxSessions/2; i++ {
+	for i := 0; i < max; i++ {
 		index := rand.Intn(len(fas))
 		i := i
 		grp.Go(func() error {
-			tx, err := testDb.BeginTx(ctx, nil)
+			tx, err := testDb.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 			if err != nil {
 				return err
 			}
 			defer tx.Rollback()
 
-			qry := `SELECT fund_account, money_type FROM ` + tableName + ` WHERE business_flag = :1 AND fund_code = :2 AND fund_account = :3`
 			stmt, err := tx.Prepare(qry)
 			if err != nil {
 				return errors.Wrapf(err, "%d.Prepare %q", i, err)
@@ -1257,8 +1332,18 @@ func TestRanaOraIssue244(t *testing.T) {
 			}
 		})
 	}
-	if err := grp.Wait(); err != nil && err != context.DeadlineExceeded {
-		t.Error(err)
+	if err := grp.Wait(); err != nil && errors.Cause(err) != context.DeadlineExceeded {
+		errS := errors.Cause(err).Error()
+		switch errS {
+		case "sql: statement is closed",
+			"sql: transaction has already been committed or rolled back":
+			return
+		}
+		if strings.Contains(errS, "ORA-12516:") {
+			t.Log(err)
+		} else {
+			t.Error(err)
+		}
 	}
 }
 
@@ -1322,27 +1407,27 @@ func TestNumberNull(t *testing.T) {
 	defer cancel()
 	testDb.Exec("DROP TABLE number_test")
 	qry := `CREATE TABLE number_test (
-	  caseNum NUMBER(3),
-	  precisionNum NUMBER(5),
+		caseNum NUMBER(3),
+		precisionNum NUMBER(5),
       precScaleNum NUMBER(5, 0),
-	  normalNum NUMBER
-	  )`
+		normalNum NUMBER
+		)`
 	if _, err := testDb.ExecContext(ctx, qry); err != nil {
 		t.Fatal(errors.Wrap(err, qry))
 	}
 	defer testDb.Exec("DROP TABLE number_test")
 
 	qry = `
-	  INSERT ALL
-	  INTO number_test (caseNum, precisionNum, precScaleNum, normalNum) VALUES (1, 4, 65, 123)
-	  INTO number_test (caseNum, precisionNum, precScaleNum, normalNum) VALUES (2, NULL, NULL, NULL)
-	  INTO number_test (caseNum, precisionNum, precScaleNum, normalNum) VALUES (3, NULL, NULL, NULL)
-	  INTO number_test (caseNum, precisionNum, precScaleNum, normalNum) VALUES (4, NULL, 42, NULL)
-	  INTO number_test (caseNum, precisionNum, precScaleNum, normalNum) VALUES (5, NULL, NULL, 31)
-	  INTO number_test (caseNum, precisionNum, precScaleNum, normalNum) VALUES (6, 3, 3, 4)
-	  INTO number_test (caseNum, precisionNum, precScaleNum, normalNum) VALUES (7, NULL, NULL, NULL)
-	  INTO number_test (caseNum, precisionNum, precScaleNum, normalNum) VALUES (8, 6, 9, 7)
-	  SELECT 1 FROM DUAL`
+		INSERT ALL
+		INTO number_test (caseNum, precisionNum, precScaleNum, normalNum) VALUES (1, 4, 65, 123)
+		INTO number_test (caseNum, precisionNum, precScaleNum, normalNum) VALUES (2, NULL, NULL, NULL)
+		INTO number_test (caseNum, precisionNum, precScaleNum, normalNum) VALUES (3, NULL, NULL, NULL)
+		INTO number_test (caseNum, precisionNum, precScaleNum, normalNum) VALUES (4, NULL, 42, NULL)
+		INTO number_test (caseNum, precisionNum, precScaleNum, normalNum) VALUES (5, NULL, NULL, 31)
+		INTO number_test (caseNum, precisionNum, precScaleNum, normalNum) VALUES (6, 3, 3, 4)
+		INTO number_test (caseNum, precisionNum, precScaleNum, normalNum) VALUES (7, NULL, NULL, NULL)
+		INTO number_test (caseNum, precisionNum, precScaleNum, normalNum) VALUES (8, 6, 9, 7)
+		SELECT 1 FROM DUAL`
 	if _, err := testDb.ExecContext(ctx, qry); err != nil {
 		t.Fatal(errors.Wrap(err, qry))
 	}
@@ -1388,8 +1473,8 @@ func TestNullFloat(t *testing.T) {
 	t.Parallel()
 	testDb.Exec("DROP TABLE test_char")
 	if _, err := testDb.Exec(`CREATE TABLE test_char (
-		  CHARS VARCHAR2(10 BYTE),
-		  FLOATS NUMBER(10, 2)
+			CHARS VARCHAR2(10 BYTE),
+			FLOATS NUMBER(10, 2)
 		)`); err != nil {
 		t.Fatal(err)
 	}
@@ -1445,5 +1530,368 @@ func TestColumnSize(t *testing.T) {
 		l, _ := col.Length()
 
 		t.Logf("Column %q has length %v", col.Name(), l)
+	}
+}
+
+func TestReturning(t *testing.T) {
+	t.Parallel()
+	defer tl.enableLogging(t)()
+	testDb.Exec("DROP TABLE test_returning")
+	if _, err := testDb.Exec("CREATE TABLE test_returning (a VARCHAR2(20))"); err != nil {
+		t.Fatal(err)
+	}
+	defer testDb.Exec("DROP TABLE test_returning")
+
+	want := "abraca dabra"
+	var got string
+	if _, err := testDb.Exec(
+		`INSERT INTO test_returning (a) VALUES (UPPER(:1)) RETURNING a INTO :2`,
+		want, sql.Out{Dest: &got},
+	); err != nil {
+		t.Fatal(err)
+	}
+	want = strings.ToUpper(want)
+	if want != got {
+		t.Errorf("got %q, wanted %q", got, want)
+	}
+
+	if _, err := testDb.Exec(
+		`UPDATE test_returning SET a = '1' WHERE 1=0 RETURNING a /*LASTINSERTID*/ INTO :1`,
+		sql.Out{Dest: &got},
+	); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("RETURNING (zero set): %v", got)
+}
+
+func TestMaxOpenCursors(t *testing.T) {
+	var openCursors sql.NullInt64
+	const qry1 = "SELECT p.value FROM v$parameter p WHERE p.name = 'open_cursors'"
+	if err := testDb.QueryRow(qry1).Scan(&openCursors); err != nil {
+		t.Log(errors.Wrap(err, qry1))
+	} else {
+		t.Logf("open_cursors=%v", openCursors)
+	}
+	n := int(openCursors.Int64)
+	if n <= 0 {
+		n = 1000
+	}
+	n *= 2
+	for i := 0; i < n; i++ {
+		var cnt int64
+		const qry2 = "DECLARE cnt PLS_INTEGER; BEGIN SELECT COUNT(0) INTO cnt FROM DUAL; :1 := cnt; END;"
+		if _, err := testDb.Exec(qry2, sql.Out{Dest: &cnt}); err != nil {
+			t.Fatal(errors.Wrapf(err, "%d. %s", i, qry2))
+		}
+	}
+}
+
+func TestRO(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tx, err := testDb.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable, ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err = tx.QueryContext(ctx, "SELECT 1 FROM DUAL"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = tx.ExecContext(ctx, "CREATE TABLE test_table (i INTEGER)"); err == nil {
+		t.Log("RO allows CREATE TABLE ?")
+	}
+	if err = tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNullIntoNum(t *testing.T) {
+	t.Parallel()
+	testDb.Exec("DROP TABLE test_null_num")
+	qry := "CREATE TABLE test_null_num (i NUMBER(3))"
+	if _, err := testDb.Exec(qry); err != nil {
+		t.Fatal(errors.Wrap(err, qry))
+	}
+	defer testDb.Exec("DROP TABLE test_null_num")
+
+	qry = "INSERT INTO test_null_num (i) VALUES (:1)"
+	var i *int
+	if _, err := testDb.Exec(qry, i); err != nil {
+		t.Fatal(errors.Wrap(err, qry))
+	}
+}
+
+func TestPing(t *testing.T) {
+	t.Parallel()
+	badDB, err := sql.Open("goracle", "bad/passw@1.1.1.1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	dl, _ := ctx.Deadline()
+	err = badDB.PingContext(ctx)
+	ok := dl.After(time.Now())
+	if err != nil {
+		t.Log(err)
+	} else {
+		t.Log("ping succeeded")
+		if !ok {
+			t.Error("ping succeeded after deadline!")
+		}
+	}
+}
+
+func TestNoConnectionPooling(t *testing.T) {
+	t.Parallel()
+	db, err := sql.Open("goracle",
+		strings.Replace(
+			strings.Replace(testConStr, "POOLED", goracle.NoConnectionPoolingConnectionClass, 1),
+			"standaloneConnection=0", "standaloneConnection=1", 1,
+		),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+}
+
+func TestExecTimeout(t *testing.T) {
+	t.Parallel()
+	defer tl.enableLogging(t)()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if _, err := testDb.ExecContext(ctx, "SELECT COUNT(DISTINCT ORA_HASH(A.table_name)) from cat, cat, cat A"); err != nil {
+		t.Log(err)
+	}
+}
+
+func TestQueryTimeout(t *testing.T) {
+	t.Parallel()
+	defer tl.enableLogging(t)()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if _, err := testDb.QueryContext(ctx, "SELECT COUNT(0) FROM all_objects, all_objects"); err != nil {
+		t.Log(err)
+	}
+}
+
+func TestSDO(t *testing.T) {
+	//t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	innerQry := `SELECT MDSYS.SDO_GEOMETRY(
+	3001,
+	NULL,
+	NULL,
+	MDSYS.SDO_ELEM_INFO_ARRAY(
+		1,1,1,4,1,0,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL
+	),
+	MDSYS.SDO_ORDINATE_ARRAY(
+		480736.567,10853969.692,0,0.998807402795312,-0.0488238888381834,0,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL)
+		) SHAPE FROM DUAL`
+	selectQry := `SELECT shape, DUMP(shape), CASE WHEN shape IS NULL THEN 'I' ELSE 'N' END FROM (` + innerQry + ")"
+	rows, err := testDb.QueryContext(ctx, selectQry)
+	if err != nil {
+		if !strings.Contains(err.Error(), `ORA-00904: "MDSYS"."SDO_GEOMETRY"`) {
+			t.Fatal(errors.Wrap(err, selectQry))
+		}
+		for _, qry := range []string{
+			`CREATE TYPE test_sdo_point_type AS OBJECT (
+			   X NUMBER,
+			   Y NUMBER,
+			   Z NUMBER)`,
+			"CREATE TYPE test_sdo_elem_info_array AS VARRAY (1048576) of NUMBER",
+			"CREATE TYPE test_sdo_ordinate_array AS VARRAY (1048576) of NUMBER",
+			`CREATE TYPE test_sdo_geometry AS OBJECT (
+			 SDO_GTYPE NUMBER,
+			 SDO_SRID NUMBER,
+			 SDO_POINT test_SDO_POINT_TYPE,
+			 SDO_ELEM_INFO test_SDO_ELEM_INFO_ARRAY,
+			 SDO_ORDINATES test_SDO_ORDINATE_ARRAY)`,
+
+			`CREATE TABLE test_sdo(
+					id INTEGER not null,
+					shape test_SDO_GEOMETRY not null
+				)`,
+		} {
+			var drop string
+			if strings.HasPrefix(qry, "CREATE TYPE") {
+				drop = "DROP TYPE " + qry[12:strings.Index(qry, " AS")] + " FORCE"
+			} else {
+				drop = "DROP TABLE " + qry[13:strings.Index(qry, "(")]
+			}
+			testDb.ExecContext(ctx, drop)
+			t.Log(drop)
+			if _, err := testDb.ExecContext(ctx, qry); err != nil {
+				err = errors.Wrap(err, qry)
+				t.Log(err)
+				if !strings.Contains(err.Error(), "ORA-01031:") {
+					t.Fatal(err)
+				}
+				//t.Skip(err)
+			}
+			defer testDb.ExecContext(ctx, drop)
+		}
+
+		selectQry = strings.Replace(selectQry, "MDSYS.SDO_", "test_SDO_", -1)
+		if rows, err = testDb.QueryContext(ctx, selectQry); err != nil {
+			t.Fatal(errors.Wrap(err, selectQry))
+		}
+
+	}
+	defer rows.Close()
+	if false {
+		goracle.Log = func(kv ...interface{}) error {
+			t.Helper()
+			t.Log(kv)
+			return nil
+		}
+	}
+	for rows.Next() {
+		var dmp, isNull string
+		var intf interface{}
+		if err = rows.Scan(&intf, &dmp, &isNull); err != nil {
+			t.Error(errors.Wrap(err, "scan"))
+		}
+		t.Log(dmp, isNull)
+		obj := intf.(*goracle.Object)
+		//t.Log("obj:", obj)
+		printObj(t, "", obj)
+	}
+	if err = rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func printObj(t *testing.T, name string, obj *goracle.Object) {
+	if obj == nil {
+		return
+	}
+	for key := range obj.Attributes {
+		sub, err := obj.Get(key)
+		t.Logf("%s.%s. %+v (err=%+v)\n", name, key, sub, err)
+		if err != nil {
+			t.Errorf("ERROR: %+v", err)
+		}
+		if ss, ok := sub.(*goracle.Object); ok {
+			printObj(t, name+"."+key, ss)
+		} else if coll, ok := sub.(*goracle.ObjectCollection); ok {
+			slice, err := coll.AsSlice(nil)
+			t.Logf("%s.%s. %+v", name, key, slice)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
+var _ = driver.Valuer((*Custom)(nil))
+
+type Custom struct {
+	Num int64
+}
+
+func (t *Custom) Value() (driver.Value, error) {
+	return t.Num, nil
+}
+
+func TestSelectCustomType(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := testDb.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	const num = 10
+	nums := &Custom{Num: num}
+	type underlying int64
+	numbers := underlying(num)
+	rows, err := testDb.QueryContext(ctx,
+		"SELECT object_name, object_type, object_id, created FROM user_objects WHERE ROWNUM < COALESCE(:alpha, :beta, 2) ORDER BY object_id",
+		sql.Named("alpha", nums),
+		goracle.MagicTypeConversion(), sql.Named("beta", numbers),
+	)
+	if err != nil {
+		t.Fatalf("%+v", err)
+	}
+	n, oldOid := 0, int64(0)
+	for rows.Next() {
+		var tbl, typ string
+		var oid int64
+		var created time.Time
+		if err := rows.Scan(&tbl, &typ, &oid, &created); err != nil {
+			t.Fatal(err)
+		}
+		t.Log(tbl, typ, oid, created)
+		if tbl == "" {
+			t.Fatal("empty tbl")
+		}
+		n++
+		if oldOid > oid {
+			t.Errorf("got oid=%d, wanted sth < %d.", oid, oldOid)
+		}
+		oldOid = oid
+	}
+	if n == 0 || n > num {
+		t.Errorf("got %d rows, wanted %d", n, num)
+	}
+}
+
+func TestExecInt64(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	qry := `CREATE OR REPLACE PROCEDURE test_i64_out(p_int NUMBER, p_out1 OUT NUMBER, p_out2 OUT NUMBER) IS
+	BEGIN p_out1 := p_int; p_out2 := p_int; END;`
+	if _, err := testDb.ExecContext(ctx, qry); err != nil {
+		t.Fatal(err)
+	}
+	defer testDb.ExecContext(ctx, "DROP PROCEDURE test_i64_out")
+
+	qry = "BEGIN test_i64_out(:1, :2, :3); END;"
+	var num sql.NullInt64
+	var str string
+	defer tl.enableLogging(t)()
+	if _, err := testDb.ExecContext(ctx, qry, 3.14, sql.Out{Dest: &num}, sql.Out{Dest: &str}); err != nil {
+		t.Fatal(err)
+	}
+	t.Log("num:", num, "str:", str)
+}
+
+func TestImplicitResults(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	const qry = `declare
+			c0 sys_refcursor;
+            c1 sys_refcursor;
+            c2 sys_refcursor;
+        begin
+			:1 := c0;
+            open c1 for
+            select 1 from DUAL;
+            dbms_sql.return_result(c1);
+            open c2 for
+            select 'A' from DUAL;
+            dbms_sql.return_result(c2);
+        end;`
+	var rows driver.Rows
+	if _, err := testDb.ExecContext(ctx, qry, sql.Out{Dest: &rows}); err != nil {
+		if strings.Contains(err.Error(), "PLS-00302:") {
+			t.Skip()
+		}
+		t.Fatal(errors.Wrap(err, qry))
+	}
+	r := rows.(driver.RowsNextResultSet)
+	for r.HasNextResultSet() {
+		if err := r.NextResultSet(); err != nil {
+			t.Error(err)
+		}
 	}
 }

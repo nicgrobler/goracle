@@ -17,13 +17,17 @@ package goracle
 
 /*
 #include <stdlib.h>
+#include <stdio.h>
 #include "dpiImpl.h"
 
-void CallbackSubscr(void *context, dpiSubscrMessage *message);
+void CallbackSubscrDebug(void *context, dpiSubscrMessage *message);
+
 */
 import "C"
+
 import (
 	"log"
+	"strings"
 	"unsafe"
 
 	"github.com/pkg/errors"
@@ -42,7 +46,7 @@ func CallbackSubscr(ctx unsafe.Pointer, message *C.dpiSubscrMessage) {
 		if rwsNum == 0 {
 			return nil
 		}
-		cRws := (*((*[1 << 30]C.dpiSubscrMessageRow)(unsafe.Pointer(rws))))[:int(rwsNum)]
+		cRws := (*((*[maxArraySize]C.dpiSubscrMessageRow)(unsafe.Pointer(rws))))[:int(rwsNum)]
 		rows := make([]RowEvent, len(cRws))
 		for i, row := range cRws {
 			rows[i] = RowEvent{
@@ -56,7 +60,7 @@ func CallbackSubscr(ctx unsafe.Pointer, message *C.dpiSubscrMessage) {
 		if tblsNum == 0 {
 			return nil
 		}
-		cTbls := (*((*[1 << 30]C.dpiSubscrMessageTable)(unsafe.Pointer(tbls))))[:int(tblsNum)]
+		cTbls := (*((*[maxArraySize]C.dpiSubscrMessageTable)(unsafe.Pointer(tbls))))[:int(tblsNum)]
 		tables := make([]TableEvent, len(cTbls))
 		for i, tbl := range cTbls {
 			tables[i] = TableEvent{
@@ -71,7 +75,7 @@ func CallbackSubscr(ctx unsafe.Pointer, message *C.dpiSubscrMessage) {
 		if qrysNum == 0 {
 			return nil
 		}
-		cQrys := (*((*[1 << 30]C.dpiSubscrMessageQuery)(unsafe.Pointer(qrys))))[:int(qrysNum)]
+		cQrys := (*((*[maxArraySize]C.dpiSubscrMessageQuery)(unsafe.Pointer(qrys))))[:int(qrysNum)]
 		queries := make([]QueryEvent, len(cQrys))
 		for i, qry := range cQrys {
 			queries[i] = QueryEvent{
@@ -127,18 +131,25 @@ type RowEvent struct {
 
 // Subscription for events in the DB.
 type Subscription struct {
-	*conn
+	conn      *conn
 	dpiSubscr *C.dpiSubscr
 	callback  func(Event)
 }
 
+func (s *Subscription) getError() error { return s.conn.getError() }
+
 // NewSubscription creates a new Subscription in the DB.
+//
+// Make sure your user has CHANGE NOTIFICATION privilege!
 func (c *conn) NewSubscription(name string, cb func(Event)) (*Subscription, error) {
+	if !c.connParams.EnableEvents {
+		return nil, errors.New("subscription must be allowed by specifying \"enableEvents=1\" in the connection parameters")
+	}
 	subscr := Subscription{conn: c, callback: cb}
 	params := (*C.dpiSubscrCreateParams)(C.malloc(C.sizeof_dpiSubscrCreateParams))
-	defer func() { C.free(unsafe.Pointer(params)) }()
+	//defer func() { C.free(unsafe.Pointer(params)) }()
 	C.dpiContext_initSubscrCreateParams(c.dpiContext, params)
-	//params.subscrNamespace = C.DPI_SUBSCR_NAMESPACE_DBCHANGE
+	params.subscrNamespace = C.DPI_SUBSCR_NAMESPACE_DBCHANGE
 	params.protocol = C.DPI_SUBSCR_PROTO_CALLBACK
 	params.qos = C.DPI_SUBSCR_QOS_BEST_EFFORT | C.DPI_SUBSCR_QOS_QUERY | C.DPI_SUBSCR_QOS_ROWIDS
 	params.operations = C.DPI_OPCODE_ALL_OPS
@@ -147,18 +158,22 @@ func (c *conn) NewSubscription(name string, cb func(Event)) (*Subscription, erro
 		params.nameLength = C.uint32_t(len(name))
 	}
 	// typedef void (*dpiSubscrCallback)(void* context, dpiSubscrMessage *message);
-	params.callback = C.dpiSubscrCallback(C.CallbackSubscr)
+	params.callback = C.dpiSubscrCallback(C.CallbackSubscrDebug)
 	params.callbackContext = unsafe.Pointer(&subscr)
 
 	dpiSubscr := (*C.dpiSubscr)(C.malloc(C.sizeof_void))
-	defer func() { C.free(unsafe.Pointer(dpiSubscr)) }()
 
-	if C.dpiConn_newSubscription(c.dpiConn,
+	if C.dpiConn_subscribe(c.dpiConn,
 		params,
 		(**C.dpiSubscr)(unsafe.Pointer(&dpiSubscr)),
-		nil,
 	) == C.DPI_FAILURE {
-		return nil, errors.Wrap(c.getError(), "newSubscription")
+		C.free(unsafe.Pointer(params))
+		C.free(unsafe.Pointer(dpiSubscr))
+		err := errors.Wrap(c.getError(), "newSubscription")
+		if strings.Contains(errors.Cause(err).Error(), "DPI-1065:") {
+			err = errors.WithMessage(err, "specify \"enableEvents=1\" connection parameter on connection to be able to use subscriptions")
+		}
+		return nil, err
 	}
 	subscr.dpiSubscr = dpiSubscr
 	return &subscr, nil
@@ -171,7 +186,7 @@ func (s *Subscription) Register(qry string, params ...interface{}) error {
 
 	var dpiStmt *C.dpiStmt
 	if C.dpiSubscr_prepareStmt(s.dpiSubscr, cQry, C.uint32_t(len(qry)), &dpiStmt) == C.DPI_FAILURE {
-		return errors.Wrap(s.getError(), "prepareStmt")
+		return errors.Wrapf(s.getError(), "prepareStmt[%p]", s.dpiSubscr)
 	}
 	defer func() { C.dpiStmt_release(dpiStmt) }()
 
@@ -194,12 +209,14 @@ func (s *Subscription) Register(qry string, params ...interface{}) error {
 // Close the subscription.
 func (s *Subscription) Close() error {
 	dpiSubscr := s.dpiSubscr
+	conn := s.conn
+	s.conn = nil
 	s.dpiSubscr = nil
 	s.callback = nil
-	if dpiSubscr == nil {
+	if dpiSubscr == nil || conn == nil || conn.dpiConn == nil {
 		return nil
 	}
-	if C.dpiSubscr_close(dpiSubscr) == C.DPI_FAILURE {
+	if C.dpiConn_unsubscribe(conn.dpiConn, dpiSubscr) == C.DPI_FAILURE {
 		return errors.Wrap(s.getError(), "close")
 	}
 	return nil

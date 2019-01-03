@@ -38,11 +38,13 @@ import (
 )
 
 type stmtOptions struct {
-	fetchRowCount int
-	arraySize     int
-	execMode      C.dpiExecMode
-	plSQLArrays   bool
-	clobAsString  bool
+	fetchRowCount       int
+	arraySize           int
+	execMode            C.dpiExecMode
+	plSQLArrays         bool
+	lobAsReader         bool
+	magicTypeConversion bool
+	callTimeout         time.Duration
 }
 
 func (o stmtOptions) ExecMode() C.dpiExecMode {
@@ -64,8 +66,12 @@ func (o stmtOptions) FetchRowCount() int {
 	}
 	return o.fetchRowCount
 }
-func (o stmtOptions) PlSQLArrays() bool  { return o.plSQLArrays }
-func (o stmtOptions) ClobAsString() bool { return o.clobAsString }
+func (o stmtOptions) PlSQLArrays() bool { return o.plSQLArrays }
+
+func (o stmtOptions) ClobAsString() bool { return !o.lobAsReader }
+func (o stmtOptions) LobAsReader() bool  { return o.lobAsReader }
+
+func (o stmtOptions) MagicTypeConversion() bool { return o.magicTypeConversion }
 
 // Option holds statement options.
 type Option func(*stmtOptions)
@@ -99,8 +105,41 @@ func ParseOnly() Option {
 func describeOnly(o *stmtOptions) { o.execMode = C.DPI_MODE_EXEC_DESCRIBE_ONLY }
 
 // ClobAsString returns an option to force fetching CLOB columns as strings.
-func ClobAsString() Option {
-	return func(o *stmtOptions) { o.clobAsString = true }
+//
+// DEPRECATED.
+func ClobAsString() Option { return func(o *stmtOptions) { o.lobAsReader = false } }
+
+// LobAsReader is an option to set query columns of CLOB/BLOB to be returned as a Lob.
+//
+// LOB as a reader and writer is not the most performant at all. Yes, OCI
+// and ODPI-C provide a way to retrieve this data directly. Effectively,
+// all you need to do is tell ODPI-C that you want a "long string" or "long
+// raw" returned. You can do that by telling ODPI-C you want a variable
+// with oracleTypeNum=DPI_ORACLE_TYPE_LONG_VARCHAR or
+// DPI_ORACLE_TYPE_LONG_RAW and nativeTypeNum=DPI_NATIVE_TYPE_BYTES. ODPI-C
+// will handle all of the dynamic fetching and allocation that is required.
+// :-) You can also use DPI_ORACLE_TYPE_VARCHAR and DPI_ORACLE_TYPE_RAW as
+// long as you set the size > 32767 -- whichever way you wish to use.
+//
+// With the use of LOBs, there is one round-trip to get the LOB locators,
+// then a round-trip for each read() that is performed. If you request the
+// length there is another round-trip required. So if you fetch 100 rows
+// with 2 CLOB columns, that means you get 401 round-trips. Using
+// string/[]bytes directly means only one round trip. So you can see that
+// if your database is remote with high latency you can have a significant
+// performance penalty!
+func LobAsReader() Option { return func(o *stmtOptions) { o.lobAsReader = true } }
+
+// MagicTypeConversion returns an option to force converting named scalar types (e.g. "type underlying int64") to their scalar underlying type.
+func MagicTypeConversion() Option {
+	return func(o *stmtOptions) { o.magicTypeConversion = true }
+}
+
+// CallTimeout sets the round-trip timeout (OCI_ATTR_CALL_TIMEOUT).
+//
+// See https://docs.oracle.com/en/database/oracle/oracle-database/18/lnoci/handle-and-descriptor-attributes.html#GUID-D8EE68EB-7E38-4068-B06E-DF5686379E5E
+func CallTimeout(d time.Duration) Option {
+	return func(o *stmtOptions) { o.callTimeout = d }
 }
 
 const minChunkSize = 1 << 16
@@ -113,16 +152,17 @@ var _ = driver.NamedValueChecker((*statement)(nil))
 type statement struct {
 	sync.Mutex
 	*conn
-	dpiStmt  *C.dpiStmt
-	query    string
-	data     [][]C.dpiData
-	vars     []*C.dpiVar
-	varInfos []varInfo
-	gets     []dataGetter
-	dests    []interface{}
-	isSlice  []bool
-	arrLen   int
-	columns  []Column
+	dpiStmt     *C.dpiStmt
+	query       string
+	data        [][]C.dpiData
+	vars        []*C.dpiVar
+	varInfos    []varInfo
+	gets        []dataGetter
+	dests       []interface{}
+	isSlice     []bool
+	arrLen      int
+	columns     []Column
+	isReturning bool
 	stmtOptions
 }
 type dataGetter func(v interface{}, data []C.dpiData) error
@@ -140,8 +180,27 @@ func (st *statement) Close() error {
 
 	return st.close()
 }
-
 func (st *statement) close() error {
+	if st == nil {
+		return nil
+	}
+	dpiStmt := st.dpiStmt
+	c := st.conn
+	st.cleanup()
+
+	var si C.dpiStmtInfo
+	if dpiStmt != nil &&
+		C.dpiStmt_getInfo(dpiStmt, &si) != C.DPI_FAILURE && // this is just to check the validity of dpiStmt, to avoid SIGSEGV
+		C.dpiStmt_release(dpiStmt) != C.DPI_FAILURE {
+		return nil
+	}
+	if c == nil {
+		return driver.ErrBadConn
+	}
+	return errors.Wrap(c.getError(), "statement/dpiStmt_release")
+}
+
+func (st *statement) cleanup() error {
 	if st == nil {
 		return nil
 	}
@@ -155,14 +214,10 @@ func (st *statement) close() error {
 	st.gets = nil
 	st.dests = nil
 	st.columns = nil
-	dpiStmt := st.dpiStmt
 	st.dpiStmt = nil
 	c := st.conn
 	st.conn = nil
 
-	if dpiStmt != nil && C.dpiStmt_release(dpiStmt) != C.DPI_FAILURE {
-		return nil
-	}
 	if c == nil {
 		return driver.ErrBadConn
 	}
@@ -220,6 +275,7 @@ func (st *statement) ExecContext(ctx context.Context, args []driver.NamedValue) 
 		*(args[0].Value.(sql.Out).Dest.(*interface{})) = st.conn
 		return driver.ResultNoRows, nil
 	}
+	st.isReturning = false
 
 	st.conn.RLock()
 	defer st.conn.RUnlock()
@@ -238,6 +294,7 @@ func (st *statement) ExecContext(ctx context.Context, args []driver.NamedValue) 
 		if !st.inTransaction {
 			mode |= C.DPI_MODE_EXEC_COMMIT_ON_SUCCESS
 		}
+		st.setCallTimeout(ctx)
 	Loop:
 		for i := 0; i < 3; i++ {
 			if err = ctx.Err(); err != nil {
@@ -268,6 +325,11 @@ func (st *statement) ExecContext(ctx context.Context, args []driver.NamedValue) 
 				Log("msg", "st.Execute", "error", err)
 			}
 			if err == nil {
+				var info C.dpiStmtInfo
+				if C.dpiStmt_getInfo(st.dpiStmt, &info) == C.DPI_FAILURE {
+					err = errors.Wrap(st.getError(), "getInfo")
+				}
+				st.isReturning = info.isReturning != 0
 				return
 			}
 			cdr, ok := errors.Cause(err).(interface {
@@ -306,7 +368,7 @@ func (st *statement) ExecContext(ctx context.Context, args []driver.NamedValue) 
 				Log("msg", "BREAK statement")
 			}
 			_ = st.Break()
-			st.close()
+			st.cleanup()
 			return nil, driver.ErrBadConn
 		}
 	}
@@ -317,6 +379,19 @@ func (st *statement) ExecContext(ctx context.Context, args []driver.NamedValue) 
 	for i, get := range st.gets {
 		if get == nil {
 			continue
+		}
+		if st.isReturning {
+			var n C.uint32_t
+			data := &st.data[i][0]
+			if C.dpiVar_getReturnedData(st.vars[i], 0, &n, &data) == C.DPI_FAILURE {
+				err = st.getError()
+				return nil, errors.Wrapf(closeIfBadConn(err), "%d.getReturnedData", i)
+			}
+			if n == 0 {
+				st.data[i] = st.data[i][:0]
+			} else {
+				st.data[i] = (*(*[maxArraySize]C.dpiData)(unsafe.Pointer(data)))[:int(n):int(n)]
+			}
 		}
 		dest := st.dests[i]
 		if !st.isSlice[i] {
@@ -369,14 +444,22 @@ func (st *statement) QueryContext(ctx context.Context, args []driver.NamedValue)
 
 	st.Lock()
 	defer st.Unlock()
+	st.isReturning = false
 	st.conn.RLock()
 	defer st.conn.RUnlock()
 
-	if st.query == getConnection {
+	switch st.query {
+	case getConnection:
 		if Log != nil {
 			Log("msg", "QueryContext", "args", args)
 		}
 		return &directRow{conn: st.conn, query: st.query, result: []interface{}{st.conn}}, nil
+
+	case wrapResultset:
+		if Log != nil {
+			Log("msg", "QueryContext", "args", args)
+		}
+		return args[0].Value.(driver.Rows), nil
 	}
 
 	//fmt.Printf("QueryContext(%+v)\n", args)
@@ -396,6 +479,7 @@ func (st *statement) QueryContext(ctx context.Context, args []driver.NamedValue)
 				done <- err
 				return
 			}
+			st.setCallTimeout(ctx)
 			if C.dpiStmt_execute(st.dpiStmt, st.ExecMode(), &colCount) != C.DPI_FAILURE {
 				break
 			}
@@ -425,7 +509,7 @@ func (st *statement) QueryContext(ctx context.Context, args []driver.NamedValue)
 				Log("msg", "BREAK query")
 			}
 			_ = st.Break()
-			st.close()
+			st.cleanup()
 			return nil, driver.ErrBadConn
 		}
 	}
@@ -443,8 +527,12 @@ func (st *statement) QueryContext(ctx context.Context, args []driver.NamedValue)
 // its number of placeholders. In that case, the sql package
 // will not sanity check Exec or Query argument counts.
 func (st *statement) NumInput() int {
+	if st.query == wrapResultset {
+		return 1
+	}
 	if st.dpiStmt == nil {
-		if st.query == getConnection {
+		switch st.query {
+		case getConnection, wrapResultset:
 			return 1
 		}
 		return 0
@@ -473,6 +561,24 @@ func (st *statement) NumInput() int {
 
 	// return the number of *unique* arguments
 	return int(cnt)
+}
+
+func (st *statement) setCallTimeout(ctx context.Context) {
+	if st.callTimeout != 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, st.callTimeout)
+		_ = cancel
+	}
+	st.conn.setCallTimeout(ctx)
+}
+
+type argInfo struct {
+	isIn, isOut bool
+	typ         C.dpiOracleTypeNum
+	natTyp      C.dpiNativeTypeNum
+	set         dataSetter
+	bufSize     int
+	objType     *C.dpiObjectType
 }
 
 // bindVars binds the given args into new variables.
@@ -526,14 +632,6 @@ func (st *statement) bindVars(args []driver.NamedValue, Log logFunc) error {
 	st.arrLen = minArrLen
 	maxArraySize := st.ArraySize()
 
-	type argInfo struct {
-		isIn, isOut bool
-		typ         C.dpiOracleTypeNum
-		natTyp      C.dpiNativeTypeNum
-		set         dataSetter
-		bufSize     int
-		objType     *C.dpiObjectType
-	}
 	infos := make([]argInfo, len(args))
 	//fmt.Printf("bindVars %d\n", len(args))
 	for i, a := range args {
@@ -609,177 +707,12 @@ func (st *statement) bindVars(args []driver.NamedValue, Log logFunc) error {
 	for i := range args {
 		info := &(infos[i])
 		value := st.dests[i]
-		if _, ok := value.(*driver.Rows); !ok {
-			if rv := reflect.ValueOf(value); rv.Kind() == reflect.Ptr {
-				value = rv.Elem().Interface()
-			}
-		}
-		switch v := value.(type) {
-		case Lob, []Lob:
-			info.typ, info.natTyp = C.DPI_ORACLE_TYPE_BLOB, C.DPI_NATIVE_TYPE_LOB
-			var isClob bool
-			switch v := v.(type) {
-			case Lob:
-				isClob = v.IsClob
-			case []Lob:
-				isClob = len(v) > 0 && v[0].IsClob
-			}
-			if isClob {
-				info.typ = C.DPI_ORACLE_TYPE_CLOB
-			}
-			info.set = st.dataSetLOB
-			if info.isOut {
-				st.gets[i] = st.dataGetLOB
-			}
-		case *driver.Rows:
-			info.typ, info.natTyp = C.DPI_ORACLE_TYPE_STMT, C.DPI_NATIVE_TYPE_STMT
-			info.set = dataSetNull
-			if info.isOut {
-				st.gets[i] = st.dataGetStmt
-			}
-		case int, []int:
-			info.typ, info.natTyp = C.DPI_ORACLE_TYPE_NUMBER, C.DPI_NATIVE_TYPE_INT64
-			info.set = dataSetNumber
-			if info.isOut {
-				st.gets[i] = dataGetNumber
-			}
-		case int32, []int32:
-			info.typ, info.natTyp = C.DPI_ORACLE_TYPE_NATIVE_INT, C.DPI_NATIVE_TYPE_INT64
-			info.set = dataSetNumber
-			if info.isOut {
-				st.gets[i] = dataGetNumber
-			}
-		case int64, []int64, sql.NullInt64, []sql.NullInt64:
-			info.typ, info.natTyp = C.DPI_ORACLE_TYPE_NUMBER, C.DPI_NATIVE_TYPE_INT64
-			info.set = dataSetNumber
-			if info.isOut {
-				st.gets[i] = dataGetNumber
-			}
-		case uint, []uint:
-			info.typ, info.natTyp = C.DPI_ORACLE_TYPE_NUMBER, C.DPI_NATIVE_TYPE_UINT64
-			info.set = dataSetNumber
-			if info.isOut {
-				st.gets[i] = dataGetNumber
-			}
-		case uint32, []uint32:
-			info.typ, info.natTyp = C.DPI_ORACLE_TYPE_NATIVE_UINT, C.DPI_NATIVE_TYPE_UINT64
-			info.set = dataSetNumber
-			if info.isOut {
-				st.gets[i] = dataGetNumber
-			}
-		case uint64, []uint64:
-			info.typ, info.natTyp = C.DPI_ORACLE_TYPE_NUMBER, C.DPI_NATIVE_TYPE_UINT64
-			info.set = dataSetNumber
-			if info.isOut {
-				st.gets[i] = dataGetNumber
-			}
-		case float32, []float32:
-			info.typ, info.natTyp = C.DPI_ORACLE_TYPE_NATIVE_FLOAT, C.DPI_NATIVE_TYPE_FLOAT
-			info.set = dataSetNumber
-			if info.isOut {
-				st.gets[i] = dataGetNumber
-			}
-		case float64, []float64:
-			info.typ, info.natTyp = C.DPI_ORACLE_TYPE_NATIVE_DOUBLE, C.DPI_NATIVE_TYPE_DOUBLE
-			info.set = dataSetNumber
-			if info.isOut {
-				st.gets[i] = dataGetNumber
-			}
-		case sql.NullFloat64, []sql.NullFloat64:
-			info.typ, info.natTyp = C.DPI_ORACLE_TYPE_NATIVE_DOUBLE, C.DPI_NATIVE_TYPE_DOUBLE
-			info.set = dataSetNumber
-			if info.isOut {
-				st.gets[i] = dataGetNumber
-			}
-		case bool, []bool:
-			info.typ, info.natTyp = C.DPI_ORACLE_TYPE_BOOLEAN, C.DPI_NATIVE_TYPE_BOOLEAN
-			info.set = dataSetBool
-			if info.isOut {
-				st.gets[i] = dataGetBool
-			}
-
-		case []byte, [][]byte:
-			info.typ, info.natTyp = C.DPI_ORACLE_TYPE_RAW, C.DPI_NATIVE_TYPE_BYTES
-			switch v := v.(type) {
-			case []byte:
-				info.bufSize = len(v)
-			case [][]byte:
-				for _, b := range v {
-					if n := len(b); n > info.bufSize {
-						info.bufSize = n
-					}
-				}
-			}
-			info.set = dataSetBytes
-			if info.isOut {
-				info.bufSize = 4000
-				st.gets[i] = dataGetBytes
-			}
-
-		case Number, []Number:
-			info.typ, info.natTyp = C.DPI_ORACLE_TYPE_NUMBER, C.DPI_NATIVE_TYPE_BYTES
-			switch v := v.(type) {
-			case Number:
-				info.bufSize = len(v)
-			case []Number:
-				for _, s := range v {
-					if n := len(s); n > info.bufSize {
-						info.bufSize = n
-					}
-				}
-			}
-			info.set = dataSetBytes
-			if info.isOut {
-				info.bufSize = 32767
-				st.gets[i] = dataGetBytes
-			}
-
-		case string, []string, nil:
-			info.typ, info.natTyp = C.DPI_ORACLE_TYPE_VARCHAR, C.DPI_NATIVE_TYPE_BYTES
-			switch v := v.(type) {
-			case string:
-				info.bufSize = 4 * len(v)
-			case []string:
-				for _, s := range v {
-					if n := 4 * len(s); n > info.bufSize {
-						info.bufSize = n
-					}
-				}
-			}
-			info.set = dataSetBytes
-			if info.isOut {
-				info.bufSize = 32767
-				st.gets[i] = dataGetBytes
-			}
-
-		case time.Time, []time.Time:
-			info.typ, info.natTyp = C.DPI_ORACLE_TYPE_DATE, C.DPI_NATIVE_TYPE_TIMESTAMP
-			info.set = dataSetTime
-			if info.isOut {
-				st.gets[i] = dataGetTime
-			}
-
-		case Object:
-			info.objType = v.ObjectType.dpiObjectType
-			info.typ, info.natTyp = C.DPI_ORACLE_TYPE_OBJECT, C.DPI_NATIVE_TYPE_OBJECT
-			info.set = st.dataSetObject
-			if info.isOut {
-				st.gets[i] = st.dataGetObject
-			}
-
-		case *Object:
-			info.objType = v.ObjectType.dpiObjectType
-			info.typ, info.natTyp = C.DPI_ORACLE_TYPE_OBJECT, C.DPI_NATIVE_TYPE_OBJECT
-			info.set = st.dataSetObject
-			if info.isOut {
-				st.gets[i] = st.dataGetObject
-			}
-
-		default:
-			return errors.Errorf("%d. arg: unknown type %T", i+1, value)
-		}
 
 		var err error
+		if value, err = st.bindVarTypeSwitch(info, &(st.gets[i]), value); err != nil {
+			return errors.Wrapf(err, "%d. arg", i+1)
+		}
+
 		var rv reflect.Value
 		if st.isSlice[i] {
 			rv = reflect.ValueOf(value)
@@ -881,6 +814,283 @@ func (st *statement) bindVars(args []driver.NamedValue, Log logFunc) error {
 	return nil
 }
 
+func (st *statement) bindVarTypeSwitch(info *argInfo, get *dataGetter, value interface{}) (interface{}, error) {
+	nilPtr := false
+	if Log != nil {
+		Log("msg", "bindVarTypeSwitch", "info", info, "value", fmt.Sprintf("[%T]%v", value, value))
+	}
+	vlr, isValuer := value.(driver.Valuer)
+
+	switch value.(type) {
+	case *driver.Rows:
+	default:
+		var magic bool
+		rv := reflect.ValueOf(value)
+		kind := rv.Kind()
+		if kind != reflect.Ptr {
+			if magic = st.MagicTypeConversion(); magic {
+				if isValuer {
+					var err error
+					if value, err = vlr.Value(); err != nil {
+						return value, errors.Wrap(err, "arg.Value()")
+					}
+					return st.bindVarTypeSwitch(info, get, value)
+				}
+			}
+		} else {
+			if nilPtr = rv.IsNil(); nilPtr {
+				info.set = dataSetNull
+				value = reflect.Zero(rv.Type().Elem()).Interface()
+			} else {
+				value = rv.Elem().Interface()
+			}
+		}
+		if magic {
+			switch kind {
+			case reflect.Bool,
+				reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+				reflect.Uint, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+				reflect.Float32, reflect.Float64,
+				reflect.String:
+			default:
+				magic = false
+			}
+		}
+		if magic {
+			switch rv.Type().Name() {
+			case "bool",
+				"int", "int8", "int16", "int32", "int64",
+				"uint", "uint8", "uint16", "uint32", "uint64",
+				"float32", "float64",
+				"string":
+				// nothing to do
+				magic = false
+			default:
+			}
+		}
+		if magic {
+			switch kind {
+			case reflect.Bool:
+				value = rv.Bool()
+			case reflect.Int:
+				value = int(rv.Int())
+			case reflect.Int8:
+				value = int8(rv.Int())
+			case reflect.Int16:
+				value = int16(rv.Int())
+			case reflect.Int32:
+				value = int32(rv.Int())
+			case reflect.Int64:
+				value = rv.Int()
+			case reflect.Uint:
+				value = uint(rv.Uint())
+			case reflect.Uint16:
+				value = uint16(rv.Uint())
+			case reflect.Uint32:
+				value = uint32(rv.Uint())
+			case reflect.Uint64:
+				value = rv.Uint()
+			case reflect.Float32:
+				value = float32(rv.Float())
+			case reflect.Float64:
+				value = rv.Float()
+			case reflect.String:
+				value = rv.String()
+			}
+		}
+	}
+
+	switch v := value.(type) {
+	case Lob, []Lob:
+		info.typ, info.natTyp = C.DPI_ORACLE_TYPE_BLOB, C.DPI_NATIVE_TYPE_LOB
+		var isClob bool
+		switch v := v.(type) {
+		case Lob:
+			isClob = v.IsClob
+		case []Lob:
+			isClob = len(v) > 0 && v[0].IsClob
+		}
+		if isClob {
+			info.typ = C.DPI_ORACLE_TYPE_CLOB
+		}
+		info.set = st.dataSetLOB
+		if info.isOut {
+			*get = st.dataGetLOB
+		}
+	case *driver.Rows:
+		info.typ, info.natTyp = C.DPI_ORACLE_TYPE_STMT, C.DPI_NATIVE_TYPE_STMT
+		info.set = dataSetNull
+		if info.isOut {
+			*get = st.dataGetStmt
+		}
+	case int, []int:
+		info.typ, info.natTyp = C.DPI_ORACLE_TYPE_NUMBER, C.DPI_NATIVE_TYPE_INT64
+		if !nilPtr {
+			info.set = dataSetNumber
+			if info.isOut {
+				*get = dataGetNumber
+			}
+		}
+	case int32, []int32:
+		info.typ, info.natTyp = C.DPI_ORACLE_TYPE_NATIVE_INT, C.DPI_NATIVE_TYPE_INT64
+		if !nilPtr {
+			info.set = dataSetNumber
+			if info.isOut {
+				*get = dataGetNumber
+			}
+		}
+	case int64, []int64, sql.NullInt64, []sql.NullInt64:
+		info.typ, info.natTyp = C.DPI_ORACLE_TYPE_NUMBER, C.DPI_NATIVE_TYPE_INT64
+		if !nilPtr {
+			info.set = dataSetNumber
+			if info.isOut {
+				*get = dataGetNumber
+			}
+		}
+	case uint, []uint:
+		info.typ, info.natTyp = C.DPI_ORACLE_TYPE_NUMBER, C.DPI_NATIVE_TYPE_UINT64
+		if !nilPtr {
+			info.set = dataSetNumber
+			if info.isOut {
+				*get = dataGetNumber
+			}
+		}
+	case uint32, []uint32:
+		info.typ, info.natTyp = C.DPI_ORACLE_TYPE_NATIVE_UINT, C.DPI_NATIVE_TYPE_UINT64
+		if !nilPtr {
+			info.set = dataSetNumber
+			if info.isOut {
+				*get = dataGetNumber
+			}
+		}
+	case uint64, []uint64:
+		info.typ, info.natTyp = C.DPI_ORACLE_TYPE_NUMBER, C.DPI_NATIVE_TYPE_UINT64
+		if !nilPtr {
+			info.set = dataSetNumber
+			if info.isOut {
+				*get = dataGetNumber
+			}
+		}
+	case float32, []float32:
+		info.typ, info.natTyp = C.DPI_ORACLE_TYPE_NATIVE_FLOAT, C.DPI_NATIVE_TYPE_FLOAT
+		if !nilPtr {
+			info.set = dataSetNumber
+			if info.isOut {
+				*get = dataGetNumber
+			}
+		}
+	case float64, []float64:
+		info.typ, info.natTyp = C.DPI_ORACLE_TYPE_NATIVE_DOUBLE, C.DPI_NATIVE_TYPE_DOUBLE
+		if !nilPtr {
+			info.set = dataSetNumber
+			if info.isOut {
+				*get = dataGetNumber
+			}
+		}
+	case sql.NullFloat64, []sql.NullFloat64:
+		info.typ, info.natTyp = C.DPI_ORACLE_TYPE_NATIVE_DOUBLE, C.DPI_NATIVE_TYPE_DOUBLE
+		info.set = dataSetNumber
+		if info.isOut {
+			*get = dataGetNumber
+		}
+	case bool, []bool:
+		info.typ, info.natTyp = C.DPI_ORACLE_TYPE_BOOLEAN, C.DPI_NATIVE_TYPE_BOOLEAN
+		info.set = dataSetBool
+		if info.isOut {
+			*get = dataGetBool
+		}
+
+	case []byte, [][]byte:
+		info.typ, info.natTyp = C.DPI_ORACLE_TYPE_RAW, C.DPI_NATIVE_TYPE_BYTES
+		switch v := v.(type) {
+		case []byte:
+			info.bufSize = len(v)
+		case [][]byte:
+			for _, b := range v {
+				if n := len(b); n > info.bufSize {
+					info.bufSize = n
+				}
+			}
+		}
+		info.set = dataSetBytes
+		if info.isOut {
+			info.bufSize = 4000
+			*get = dataGetBytes
+		}
+
+	case Number, []Number:
+		info.typ, info.natTyp = C.DPI_ORACLE_TYPE_NUMBER, C.DPI_NATIVE_TYPE_BYTES
+		switch v := v.(type) {
+		case Number:
+			info.bufSize = len(v)
+		case []Number:
+			for _, s := range v {
+				if n := len(s); n > info.bufSize {
+					info.bufSize = n
+				}
+			}
+		}
+		info.set = dataSetBytes
+		if info.isOut {
+			info.bufSize = 32767
+			*get = dataGetBytes
+		}
+
+	case string, []string, nil:
+		info.typ, info.natTyp = C.DPI_ORACLE_TYPE_VARCHAR, C.DPI_NATIVE_TYPE_BYTES
+		switch v := v.(type) {
+		case string:
+			info.bufSize = 4 * len(v)
+		case []string:
+			for _, s := range v {
+				if n := 4 * len(s); n > info.bufSize {
+					info.bufSize = n
+				}
+			}
+		}
+		info.set = dataSetBytes
+		if info.isOut {
+			info.bufSize = 32767
+			*get = dataGetBytes
+		}
+
+	case time.Time, []time.Time:
+		info.typ, info.natTyp = C.DPI_ORACLE_TYPE_DATE, C.DPI_NATIVE_TYPE_TIMESTAMP
+		info.set = dataSetTime
+		if info.isOut {
+			*get = dataGetTime
+		}
+
+	case Object:
+		info.objType = v.ObjectType.dpiObjectType
+		info.typ, info.natTyp = C.DPI_ORACLE_TYPE_OBJECT, C.DPI_NATIVE_TYPE_OBJECT
+		info.set = st.dataSetObject
+		if info.isOut {
+			*get = st.dataGetObject
+		}
+
+	case *Object:
+		info.objType = v.ObjectType.dpiObjectType
+		info.typ, info.natTyp = C.DPI_ORACLE_TYPE_OBJECT, C.DPI_NATIVE_TYPE_OBJECT
+		info.set = st.dataSetObject
+		if info.isOut {
+			*get = st.dataGetObject
+		}
+
+	default:
+		if !isValuer {
+			return value, errors.Errorf("unknown type %T", value)
+		}
+		var err error
+		if value, err = vlr.Value(); err != nil {
+			return value, errors.Wrap(err, "arg.Value()")
+		}
+		return st.bindVarTypeSwitch(info, get, value)
+	}
+
+	return value, nil
+}
+
 type dataSetter func(dv *C.dpiVar, data []C.dpiData, vv interface{}) error
 
 func dataSetNull(dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
@@ -891,7 +1101,7 @@ func dataSetNull(dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
 }
 func dataGetBool(v interface{}, data []C.dpiData) error {
 	if b, ok := v.(*bool); ok {
-		if data[0].isNull == 1 {
+		if len(data) == 0 || data[0].isNull == 1 {
 			*b = false
 			return nil
 		}
@@ -934,6 +1144,10 @@ func dataSetBool(dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
 }
 func dataGetTime(v interface{}, data []C.dpiData) error {
 	if x, ok := v.(*time.Time); ok {
+		if len(data) == 0 || data[0].isNull == 1 {
+			*x = time.Time{}
+			return nil
+		}
 		dataGetTimeC(x, &data[0])
 		return nil
 	}
@@ -999,7 +1213,7 @@ func dataSetTime(dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
 func dataGetNumber(v interface{}, data []C.dpiData) error {
 	switch x := v.(type) {
 	case *int:
-		if data[0].isNull == 1 {
+		if len(data) == 0 || data[0].isNull == 1 {
 			*x = 0
 		} else {
 			*x = int(C.dpiData_getInt64(&data[0]))
@@ -1014,7 +1228,11 @@ func dataGetNumber(v interface{}, data []C.dpiData) error {
 			}
 		}
 	case *int32:
-		*x = int32(C.dpiData_getInt64(&data[0]))
+		if len(data) == 0 || data[0].isNull == 1 {
+			*x = 0
+		} else {
+			*x = int32(C.dpiData_getInt64(&data[0]))
+		}
 	case *[]int32:
 		*x = (*x)[:0]
 		for i := range data {
@@ -1025,7 +1243,7 @@ func dataGetNumber(v interface{}, data []C.dpiData) error {
 			}
 		}
 	case *int64:
-		if data[0].isNull == 1 {
+		if len(data) == 0 || data[0].isNull == 1 {
 			*x = 0
 		} else {
 			*x = int64(C.dpiData_getInt64(&data[0]))
@@ -1040,7 +1258,7 @@ func dataGetNumber(v interface{}, data []C.dpiData) error {
 			}
 		}
 	case *sql.NullInt64:
-		if data[0].isNull == 1 {
+		if len(data) == 0 || data[0].isNull == 1 {
 			x.Valid = false
 		} else {
 			x.Valid, x.Int64 = true, int64(C.dpiData_getInt64(&data[0]))
@@ -1056,7 +1274,7 @@ func dataGetNumber(v interface{}, data []C.dpiData) error {
 			}
 		}
 	case *sql.NullFloat64:
-		if data[0].isNull == 1 {
+		if len(data) == 0 || data[0].isNull == 1 {
 			x.Valid = false
 		} else {
 			x.Valid, x.Float64 = true, float64(C.dpiData_getDouble(&data[0]))
@@ -1072,7 +1290,7 @@ func dataGetNumber(v interface{}, data []C.dpiData) error {
 		}
 
 	case *uint:
-		if data[0].isNull == 1 {
+		if len(data) == 0 || data[0].isNull == 1 {
 			*x = 0
 		} else {
 			*x = uint(C.dpiData_getUint64(&data[0]))
@@ -1087,7 +1305,7 @@ func dataGetNumber(v interface{}, data []C.dpiData) error {
 			}
 		}
 	case *uint32:
-		if data[0].isNull == 1 {
+		if len(data) == 0 || data[0].isNull == 1 {
 			*x = 0
 		} else {
 			*x = uint32(C.dpiData_getUint64(&data[0]))
@@ -1102,7 +1320,7 @@ func dataGetNumber(v interface{}, data []C.dpiData) error {
 			}
 		}
 	case *uint64:
-		if data[0].isNull == 1 {
+		if len(data) == 0 || data[0].isNull == 1 {
 			*x = 0
 		} else {
 			*x = uint64(C.dpiData_getUint64(&data[0]))
@@ -1118,7 +1336,7 @@ func dataGetNumber(v interface{}, data []C.dpiData) error {
 		}
 
 	case *float32:
-		if data[0].isNull == 1 {
+		if len(data) == 0 || data[0].isNull == 1 {
 			*x = 0
 		} else {
 			*x = float32(C.dpiData_getFloat(&data[0]))
@@ -1133,7 +1351,7 @@ func dataGetNumber(v interface{}, data []C.dpiData) error {
 			}
 		}
 	case *float64:
-		if data[0].isNull == 1 {
+		if len(data) == 0 || data[0].isNull == 1 {
 			*x = 0
 		} else {
 			*x = float64(C.dpiData_getDouble(&data[0]))
@@ -1268,7 +1486,7 @@ func dataSetNumber(dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
 func dataGetBytes(v interface{}, data []C.dpiData) error {
 	switch x := v.(type) {
 	case *[]byte:
-		if data[0].isNull == 1 {
+		if len(data) == 0 || data[0].isNull == 1 {
 			*x = nil
 			return nil
 		}
@@ -1287,7 +1505,7 @@ func dataGetBytes(v interface{}, data []C.dpiData) error {
 		}
 
 	case *Number:
-		if data[0].isNull == 1 {
+		if len(data) == 0 || data[0].isNull == 1 {
 			*x = ""
 			return nil
 		}
@@ -1305,7 +1523,7 @@ func dataGetBytes(v interface{}, data []C.dpiData) error {
 		}
 
 	case *string:
-		if data[0].isNull == 1 {
+		if len(data) == 0 || data[0].isNull == 1 {
 			*x = ""
 			return nil
 		}
@@ -1436,6 +1654,10 @@ func dataSetBytes(dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
 
 func (c *conn) dataGetStmt(v interface{}, data []C.dpiData) error {
 	if row, ok := v.(*driver.Rows); ok {
+		if len(data) == 0 || data[0].isNull == 1 {
+			*row = nil
+			return nil
+		}
 		return c.dataGetStmtC(row, &data[0])
 	}
 	rows := v.(*[]driver.Rows)
@@ -1474,6 +1696,10 @@ func (c *conn) dataGetStmtC(row *driver.Rows, data *C.dpiData) error {
 
 func (c *conn) dataGetLOB(v interface{}, data []C.dpiData) error {
 	if L, ok := v.(*Lob); ok {
+		if len(data) == 0 || data[0].isNull == 1 {
+			*L = Lob{}
+			return nil
+		}
 		c.dataGetLOBC(L, &data[0])
 		return nil
 	}
@@ -1556,7 +1782,7 @@ func (c *conn) dataSetLOB(dv *C.dpiVar, data []C.dpiData, vv interface{}) error 
 }
 
 func (c *conn) dataSetObject(dv *C.dpiVar, data []C.dpiData, vv interface{}) error {
-	fmt.Printf("\ndataSetObject(dv=%+v, data=%+v, vv=%+v)\n", dv, data, vv)
+	//fmt.Printf("\ndataSetObject(dv=%+v, data=%+v, vv=%+v)\n", dv, data, vv)
 	if len(data) == 0 {
 		return nil
 	}
@@ -1639,7 +1865,7 @@ func (st *statement) openRows(colCount int) (*rows, error) {
 		vars:      make([]*C.dpiVar, colCount),
 		data:      make([][]C.dpiData, colCount),
 	}
-	vi := varInfo{SliceLen: st.FetchRowCount()}
+	sliceLen := st.FetchRowCount()
 
 	var info C.dpiQueryInfo
 	var ti C.dpiDataTypeInfo
@@ -1660,6 +1886,17 @@ func (st *statement) openRows(colCount int) (*rows, error) {
 			}
 		case C.DPI_ORACLE_TYPE_DATE:
 			ti.defaultNativeTypeNum = C.DPI_NATIVE_TYPE_TIMESTAMP
+
+		case C.DPI_ORACLE_TYPE_BLOB:
+			if !st.LobAsReader() {
+				ti.oracleTypeNum = C.DPI_ORACLE_TYPE_LONG_RAW
+				ti.defaultNativeTypeNum = C.DPI_NATIVE_TYPE_BYTES
+			}
+		case C.DPI_ORACLE_TYPE_CLOB:
+			if !st.LobAsReader() {
+				ti.oracleTypeNum = C.DPI_ORACLE_TYPE_LONG_VARCHAR
+				ti.defaultNativeTypeNum = C.DPI_NATIVE_TYPE_BYTES
+			}
 		}
 		r.columns[i] = Column{
 			Name:        C.GoStringN(info.name, C.int(info.nameLength)),
@@ -1675,7 +1912,13 @@ func (st *statement) openRows(colCount int) (*rows, error) {
 		}
 		var err error
 		//fmt.Printf("%d. %+v\n", i, r.columns[i])
-		vi.Typ, vi.NatTyp, vi.BufSize = ti.oracleTypeNum, ti.defaultNativeTypeNum, bufSize
+		vi := varInfo{
+			Typ:        ti.oracleTypeNum,
+			NatTyp:     ti.defaultNativeTypeNum,
+			ObjectType: ti.objectType,
+			BufSize:    bufSize,
+			SliceLen:   sliceLen,
+		}
 		if r.vars[i], r.data[i], err = st.newVar(vi); err != nil {
 			return nil, err
 		}

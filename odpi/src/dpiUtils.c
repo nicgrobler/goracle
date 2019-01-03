@@ -1,5 +1,5 @@
 //-----------------------------------------------------------------------------
-// Copyright (c) 2016, 2017 Oracle and/or its affiliates.  All rights reserved.
+// Copyright (c) 2016, 2018, Oracle and/or its affiliates. All rights reserved.
 // This program is free software: you can modify it and/or redistribute it
 // under the terms of:
 //
@@ -32,6 +32,44 @@ int dpiUtils__allocateMemory(size_t numMembers, size_t memberSize,
     if (dpiDebugLevel & DPI_DEBUG_LEVEL_MEM)
         dpiDebug__print("allocated %u bytes at %p (%s)\n",
                 numMembers * memberSize, *ptr, action);
+    return DPI_SUCCESS;
+}
+
+
+//-----------------------------------------------------------------------------
+// dpiUtils__checkClientVersion() [INTERNAL]
+//   Check the Oracle Client version and verify that it is at least at the
+// minimum version that is required.
+//-----------------------------------------------------------------------------
+int dpiUtils__checkClientVersion(dpiVersionInfo *versionInfo,
+        int minVersionNum, int minReleaseNum, dpiError *error)
+{
+    if (versionInfo->versionNum < minVersionNum ||
+            (versionInfo->versionNum == minVersionNum &&
+                    versionInfo->releaseNum < minReleaseNum))
+        return dpiError__set(error, "check Oracle Client version",
+                DPI_ERR_ORACLE_CLIENT_TOO_OLD, versionInfo->versionNum,
+                versionInfo->releaseNum, minVersionNum, minReleaseNum);
+    return DPI_SUCCESS;
+}
+
+
+//-----------------------------------------------------------------------------
+// dpiUtils__checkDatabaseVersion() [INTERNAL]
+//   Check the Oracle Database version and verify that it is at least at the
+// minimum version that is required.
+//-----------------------------------------------------------------------------
+int dpiUtils__checkDatabaseVersion(dpiConn *conn, int minVersionNum,
+        int minReleaseNum, dpiError *error)
+{
+    if (dpiConn__getServerVersion(conn, error) < 0)
+        return DPI_FAILURE;
+    if (conn->versionInfo.versionNum < minVersionNum ||
+            (conn->versionInfo.versionNum == minVersionNum &&
+                    conn->versionInfo.releaseNum < minReleaseNum))
+        return dpiError__set(error, "check Oracle Database version",
+                DPI_ERR_ORACLE_DB_TOO_OLD, conn->versionInfo.versionNum,
+                conn->versionInfo.releaseNum, minVersionNum, minReleaseNum);
     return DPI_SUCCESS;
 }
 
@@ -111,11 +149,12 @@ int dpiUtils__parseNumberString(const char *value, uint32_t valueLength,
         uint8_t *numDigits, uint8_t *digits, dpiError *error)
 {
     char convertedValue[DPI_NUMBER_AS_TEXT_CHARS], exponentDigits[4];
-    int exponentIsNegative, exponent;
     uint8_t numExponentDigits, digit;
     uint32_t convertedValueLength;
     uint16_t *utf16chars, i;
+    int exponentIsNegative;
     const char *endValue;
+    int16_t exponent;
 
     // empty strings are not valid numbers
     if (valueLength == 0)
@@ -212,7 +251,7 @@ int dpiUtils__parseNumberString(const char *value, uint32_t valueLength,
             return dpiError__set(error, "no digits in exponent",
                     DPI_ERR_INVALID_NUMBER);
         exponentDigits[numExponentDigits] = '\0';
-        exponent = (int) strtol(exponentDigits, NULL, 0);
+        exponent = (int16_t) strtol(exponentDigits, NULL, 0);
         if (exponentIsNegative)
             exponent = -exponent;
         *decimalPointIndex += exponent;

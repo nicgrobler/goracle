@@ -16,6 +16,7 @@
 package goracle
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -34,6 +35,18 @@ func TestParseConnString(t *testing.T) {
 	wantXO := wantDefault
 	wantXO.SID = "localhost/sid"
 
+	wantHeterogeneous := wantXO
+	wantHeterogeneous.HeterogeneousPool = true
+
+	setP := func(s, p string) string {
+		if i := strings.Index(s, ":SECRET-"); i >= 0 {
+			if j := strings.Index(s[i:], "@"); j >= 0 {
+				return s[:i+1] + p + s[i+j:]
+			}
+		}
+		return s
+	}
+
 	for tName, tCase := range map[string]struct {
 		In   string
 		Want ConnectionParams
@@ -44,9 +57,12 @@ func TestParseConnString(t *testing.T) {
 				ConnClass: "POOLED", IsSysOper: true,
 				MinSessions: 3, MaxSessions: 9, PoolIncrement: 3}},
 
-		"@": {In: wantAt.String(), Want: wantAt},
+		"@": {
+			In:   setP(wantAt.String(), wantAt.Password),
+			Want: wantAt},
 
-		"xo": {In: "oracle://user:pass@localhost/sid", Want: wantXO},
+		"xo":            {In: "oracle://user:pass@localhost/sid", Want: wantXO},
+		"heterogeneous": {In: "oracle://user:pass@localhost/sid?heterogeneousPool=1", Want: wantHeterogeneous},
 	} {
 		t.Log(tCase.In)
 		P, err := ParseConnString(tCase.In)
@@ -55,21 +71,21 @@ func TestParseConnString(t *testing.T) {
 			continue
 		}
 		if P != tCase.Want {
-			t.Errorf("%s: got %+v, wanted %+v\n%s", tName, P, tCase.Want, cmp.Diff(tCase.Want, P))
+			t.Errorf("%s: parse of %q got %#v, wanted %#v\n%s", tName, tCase.In, P, tCase.Want, cmp.Diff(tCase.Want, P))
 			continue
 		}
-		s := P.String()
+		s := setP(P.String(), P.Password)
 		Q, err := ParseConnString(s)
 		if err != nil {
-			t.Errorf("%s: %v", tName, err)
+			t.Errorf("%s: parseConnString %v", tName, err)
 			continue
 		}
 		if P != Q {
-			t.Errorf("%s: got %+v, wanted %+v\n%s", tName, P, Q, cmp.Diff(P, Q))
+			t.Errorf("%s: params got %+v, wanted %+v\n%s", tName, P, Q, cmp.Diff(P, Q))
 			continue
 		}
-		if got := Q.String(); s != got {
-			t.Errorf("%s: got %q, wanted %q", tName, got, s)
+		if got := setP(Q.String(), Q.Password); s != got {
+			t.Errorf("%s: paramString got %q, wanted %q", tName, got, s)
 		}
 	}
 }

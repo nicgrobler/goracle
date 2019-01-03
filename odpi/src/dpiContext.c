@@ -1,5 +1,5 @@
 //-----------------------------------------------------------------------------
-// Copyright (c) 2016, 2017 Oracle and/or its affiliates.  All rights reserved.
+// Copyright (c) 2016, 2018, Oracle and/or its affiliates. All rights reserved.
 // This program is free software: you can modify it and/or redistribute it
 // under the terms of:
 //
@@ -77,13 +77,9 @@ void dpiContext__initCommonCreateParams(dpiCommonCreateParams *params)
 // the structure size as a convenience for calling functions which may have to
 // differentiate between different ODPI-C application versions.
 //-----------------------------------------------------------------------------
-void dpiContext__initConnCreateParams(const dpiContext *context,
-        dpiConnCreateParams *params, size_t *structSize)
+void dpiContext__initConnCreateParams(dpiConnCreateParams *params)
 {
-    *structSize = sizeof(dpiConnCreateParams);
-    if (context->dpiMinorVersion == 0)
-        *structSize = sizeof(dpiConnCreateParams__v20);
-    memset(params, 0, *structSize);
+    memset(params, 0, sizeof(dpiConnCreateParams));
 }
 
 
@@ -105,6 +101,16 @@ void dpiContext__initPoolCreateParams(dpiPoolCreateParams *params)
 
 
 //-----------------------------------------------------------------------------
+// dpiContext__initSodaOperOptions() [INTERNAL]
+//   Initialize the SODA operation options to default values.
+//-----------------------------------------------------------------------------
+void dpiContext__initSodaOperOptions(dpiSodaOperOptions *options)
+{
+    memset(options, 0, sizeof(dpiSodaOperOptions));
+}
+
+
+//-----------------------------------------------------------------------------
 // dpiContext__initSubscrCreateParams() [INTERNAL]
 //   Initialize the subscription creation parameters to default values.
 //-----------------------------------------------------------------------------
@@ -112,6 +118,7 @@ void dpiContext__initSubscrCreateParams(dpiSubscrCreateParams *params)
 {
     memset(params, 0, sizeof(dpiSubscrCreateParams));
     params->subscrNamespace = DPI_SUBSCR_NAMESPACE_DBCHANGE;
+    params->groupingType = DPI_SUBSCR_GROUPING_TYPE_SUMMARY;
 }
 
 
@@ -223,14 +230,13 @@ int dpiContext_initCommonCreateParams(const dpiContext *context,
 int dpiContext_initConnCreateParams(const dpiContext *context,
         dpiConnCreateParams *params)
 {
-    size_t structSize;
     dpiError error;
 
     if (dpiGen__startPublicFn(context, DPI_HTYPE_CONTEXT, __func__, 0,
             &error) < 0)
         return dpiGen__endPublicFn(context, DPI_FAILURE, &error);
     DPI_CHECK_PTR_NOT_NULL(context, params)
-    dpiContext__initConnCreateParams(context, params, &structSize);
+    dpiContext__initConnCreateParams(params);
     return dpiGen__endPublicFn(context, DPI_SUCCESS, &error);
 }
 
@@ -249,6 +255,24 @@ int dpiContext_initPoolCreateParams(const dpiContext *context,
         return dpiGen__endPublicFn(context, DPI_FAILURE, &error);
     DPI_CHECK_PTR_NOT_NULL(context, params)
     dpiContext__initPoolCreateParams(params);
+    return dpiGen__endPublicFn(context, DPI_SUCCESS, &error);
+}
+
+
+//-----------------------------------------------------------------------------
+// dpiContext_initSodaOperOptions() [PUBLIC]
+//   Initialize the SODA operation options to default values.
+//-----------------------------------------------------------------------------
+int dpiContext_initSodaOperOptions(const dpiContext *context,
+        dpiSodaOperOptions *options)
+{
+    dpiError error;
+
+    if (dpiGen__startPublicFn(context, DPI_HTYPE_CONTEXT, __func__, 0,
+            &error) < 0)
+        return dpiGen__endPublicFn(context, DPI_FAILURE, &error);
+    DPI_CHECK_PTR_NOT_NULL(context, options)
+    dpiContext__initSodaOperOptions(options);
     return dpiGen__endPublicFn(context, DPI_SUCCESS, &error);
 }
 

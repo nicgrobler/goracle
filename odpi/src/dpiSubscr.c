@@ -1,5 +1,5 @@
 //-----------------------------------------------------------------------------
-// Copyright (c) 2016, 2017 Oracle and/or its affiliates.  All rights reserved.
+// Copyright (c) 2016, 2018, Oracle and/or its affiliates. All rights reserved.
 // This program is free software: you can modify it and/or redistribute it
 // under the terms of:
 //
@@ -50,6 +50,7 @@ static void dpiSubscr__callback(dpiSubscr *subscr, UNUSED void *handle,
         dpiError__getInfo(&error, &errorInfo);
         message.errorInfo = &errorInfo;
     }
+    message.registered = subscr->registered;
 
     // invoke user callback
     (*subscr->callback)(subscr->callbackContext, &message);
@@ -61,19 +62,17 @@ static void dpiSubscr__callback(dpiSubscr *subscr, UNUSED void *handle,
 
 
 //-----------------------------------------------------------------------------
-// dpiSubscr__checkOpen() [INTERNAL]
+// dpiSubscr__check() [INTERNAL]
 //   Determine if the subscription is open and available for use.
 //-----------------------------------------------------------------------------
-static int dpiSubscr__checkOpen(dpiSubscr *subscr, const char *fnName,
+static int dpiSubscr__check(dpiSubscr *subscr, const char *fnName,
         dpiError *error)
 {
     if (dpiGen__startPublicFn(subscr, DPI_HTYPE_SUBSCR, fnName, 1, error) < 0)
         return DPI_FAILURE;
     if (!subscr->handle)
         return dpiError__set(error, "check closed", DPI_ERR_SUBSCR_CLOSED);
-    if (!subscr->conn->handle || subscr->conn->closing)
-        return dpiError__set(error, "check connection", DPI_ERR_NOT_CONNECTED);
-    return DPI_SUCCESS;
+    return dpiConn__checkConnected(subscr->conn, error);
 }
 
 
@@ -83,9 +82,10 @@ static int dpiSubscr__checkOpen(dpiSubscr *subscr, const char *fnName,
 // is returned.
 //-----------------------------------------------------------------------------
 int dpiSubscr__create(dpiSubscr *subscr, dpiConn *conn,
-        dpiSubscrCreateParams *params, uint64_t *subscrId, dpiError *error)
+        dpiSubscrCreateParams *params, dpiError *error)
 {
     uint32_t qosFlags;
+    int32_t int32Val;
     int rowids;
 
     // retain a reference to the connection
@@ -93,6 +93,7 @@ int dpiSubscr__create(dpiSubscr *subscr, dpiConn *conn,
     subscr->conn = conn;
     subscr->callback = params->callback;
     subscr->callbackContext = params->callbackContext;
+    subscr->subscrNamespace = params->subscrNamespace;
     subscr->qos = params->qos;
 
     // create the subscription handle
@@ -116,6 +117,13 @@ int dpiSubscr__create(dpiSubscr *subscr, dpiConn *conn,
     if (dpiOci__attrSet(subscr->handle, DPI_OCI_HTYPE_SUBSCRIPTION,
             (void*) &params->timeout, sizeof(uint32_t),
             DPI_OCI_ATTR_SUBSCR_TIMEOUT, "set timeout", error) < 0)
+        return DPI_FAILURE;
+
+    // set the IP address used on the client to listen for events
+    if (params->ipAddress && params->ipAddressLength > 0 &&
+            dpiOci__attrSet(subscr->env->handle, DPI_OCI_HTYPE_ENV,
+                    (void*) params->ipAddress, params->ipAddressLength,
+                    DPI_OCI_ATTR_SUBSCR_IPADDR, "set IP address", error) < 0)
         return DPI_FAILURE;
 
     // set the port number used on the client to listen for events
@@ -180,16 +188,44 @@ int dpiSubscr__create(dpiSubscr *subscr, dpiConn *conn,
             DPI_OCI_ATTR_CHNF_OPERATIONS, "set operations", error) < 0)
         return DPI_FAILURE;
 
+    // set grouping information, if applicable
+    if (params->groupingClass) {
+
+        // set grouping class
+        if (dpiOci__attrSet(subscr->handle, DPI_OCI_HTYPE_SUBSCRIPTION,
+                (void*) &params->groupingClass, 0,
+                DPI_OCI_ATTR_SUBSCR_NTFN_GROUPING_CLASS, "set grouping class",
+                error) < 0)
+            return DPI_FAILURE;
+
+        // set grouping value
+        if (dpiOci__attrSet(subscr->handle, DPI_OCI_HTYPE_SUBSCRIPTION,
+                (void*) &params->groupingValue, 0,
+                DPI_OCI_ATTR_SUBSCR_NTFN_GROUPING_VALUE, "set grouping value",
+                error) < 0)
+            return DPI_FAILURE;
+
+        // set grouping type
+        if (dpiOci__attrSet(subscr->handle, DPI_OCI_HTYPE_SUBSCRIPTION,
+                (void*) &params->groupingType, 0,
+                DPI_OCI_ATTR_SUBSCR_NTFN_GROUPING_TYPE, "set grouping type",
+                error) < 0)
+            return DPI_FAILURE;
+
+        // set grouping repeat count
+        int32Val = DPI_SUBSCR_GROUPING_FOREVER;
+        if (dpiOci__attrSet(subscr->handle, DPI_OCI_HTYPE_SUBSCRIPTION,
+                (void*) &int32Val, 0,
+                DPI_OCI_ATTR_SUBSCR_NTFN_GROUPING_REPEAT_COUNT,
+                "set grouping repeat count", error) < 0)
+            return DPI_FAILURE;
+
+    }
+
     // register the subscription
     if (dpiOci__subscriptionRegister(conn, &subscr->handle, error) < 0)
         return DPI_FAILURE;
     subscr->registered = 1;
-
-    // get the registration id, if applicable
-    if (subscrId && dpiOci__attrGet(subscr->handle, DPI_OCI_HTYPE_SUBSCRIPTION,
-            subscrId, NULL, DPI_OCI_ATTR_SUBSCR_CQ_REGID,
-            "get registration id", error) < 0)
-        return DPI_FAILURE;
 
     return DPI_SUCCESS;
 }
@@ -203,7 +239,7 @@ void dpiSubscr__free(dpiSubscr *subscr, dpiError *error)
 {
     if (subscr->handle) {
         if (subscr->registered)
-            dpiOci__subscriptionUnRegister(subscr, error);
+            dpiOci__subscriptionUnRegister(subscr->conn, subscr, error);
         dpiOci__handleFree(subscr->handle, DPI_OCI_HTYPE_SUBSCRIPTION);
         subscr->handle = NULL;
     }
@@ -247,6 +283,41 @@ static void dpiSubscr__freeMessage(dpiSubscrMessage *message)
         }
         dpiUtils__freeMemory(message->queries);
     }
+}
+
+
+//-----------------------------------------------------------------------------
+// dpiSubscr__populateAQMessage() [INTERNAL]
+//   Populate message with details.
+//-----------------------------------------------------------------------------
+static int dpiSubscr__populateAQMessage(dpiSubscr *subscr,
+        dpiSubscrMessage *message, void *descriptor, dpiError *error)
+{
+    uint32_t flags = 0;
+
+    // determine if message is a deregistration message
+    if (dpiOci__attrGet(descriptor, DPI_OCI_DTYPE_AQNFY_DESCRIPTOR, &flags,
+            NULL, DPI_OCI_ATTR_NFY_FLAGS, "get flags", error) < 0)
+        return DPI_FAILURE;
+    message->eventType = (flags == 1) ? DPI_EVENT_DEREG : DPI_EVENT_AQ;
+    if (message->eventType == DPI_EVENT_DEREG) {
+        subscr->registered = 0;
+        return DPI_SUCCESS;
+    }
+
+    // determine the name of the queue which spawned the event
+    if (dpiOci__attrGet(descriptor, DPI_OCI_DTYPE_AQNFY_DESCRIPTOR,
+            (void*) &message->queueName, &message->queueNameLength,
+            DPI_OCI_ATTR_QUEUE_NAME, "get queue name", error) < 0)
+        return DPI_FAILURE;
+
+    // determine the consumer name for the queue that spawned the event
+    if (dpiOci__attrGet(descriptor, DPI_OCI_DTYPE_AQNFY_DESCRIPTOR,
+            (void*) &message->consumerName, &message->consumerNameLength,
+            DPI_OCI_ATTR_CONSUMER_NAME, "get consumer name", error) < 0)
+        return DPI_FAILURE;
+
+    return DPI_SUCCESS;
 }
 
 
@@ -303,6 +374,17 @@ static int dpiSubscr__populateMessage(dpiSubscr *subscr,
         dpiSubscrMessage *message, void *descriptor, dpiError *error)
 {
     void *rawValue;
+
+    // if quality of service flag indicates that deregistration should take
+    // place when the first notification is received, mark the subscription
+    // as no longer registered
+    if (subscr->qos & DPI_SUBSCR_QOS_DEREG_NFY)
+        subscr->registered = 0;
+
+    // handle AQ messages, if applicable
+    if (subscr->subscrNamespace == DPI_SUBSCR_NAMESPACE_AQ)
+        return dpiSubscr__populateAQMessage(subscr, message, descriptor,
+                error);
 
     // determine the type of event that was spawned
     if (dpiOci__attrGet(descriptor, DPI_OCI_DTYPE_CHDES, &message->eventType,
@@ -555,27 +637,6 @@ int dpiSubscr_addRef(dpiSubscr *subscr)
 
 
 //-----------------------------------------------------------------------------
-// dpiSubscr_close() [PUBLIC]
-//   Close the subscription now, not when the last reference is released. This
-// deregisters the subscription so that notifications are no longer sent.
-//-----------------------------------------------------------------------------
-int dpiSubscr_close(dpiSubscr *subscr)
-{
-    dpiError error;
-
-    if (dpiSubscr__checkOpen(subscr, __func__, &error) < 0)
-        return dpiGen__endPublicFn(subscr, DPI_FAILURE, &error);
-    if (subscr->registered) {
-        if (dpiOci__subscriptionUnRegister(subscr, &error) < 0)
-            return dpiGen__endPublicFn(subscr, DPI_FAILURE, &error);
-        subscr->registered = 0;
-    }
-
-    return dpiGen__endPublicFn(subscr, DPI_SUCCESS, &error);
-}
-
-
-//-----------------------------------------------------------------------------
 // dpiSubscr_prepareStmt() [PUBLIC]
 //   Prepare statement for registration with subscription.
 //-----------------------------------------------------------------------------
@@ -585,7 +646,7 @@ int dpiSubscr_prepareStmt(dpiSubscr *subscr, const char *sql,
     dpiStmt *tempStmt;
     dpiError error;
 
-    if (dpiSubscr__checkOpen(subscr, __func__, &error) < 0)
+    if (dpiSubscr__check(subscr, __func__, &error) < 0)
         return dpiGen__endPublicFn(subscr, DPI_FAILURE, &error);
     DPI_CHECK_PTR_NOT_NULL(subscr, sql)
     DPI_CHECK_PTR_NOT_NULL(subscr, stmt)
