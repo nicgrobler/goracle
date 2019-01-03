@@ -56,7 +56,6 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
